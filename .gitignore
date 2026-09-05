@@ -1,0 +1,21 @@
+# 実行環境。micromamba と npm で作り直せる
+.venv/
+.pg/
+.node/
+web/node_modules/
+
+# 稼働中のデータベースと控え。中身は成果物であってソースではない
+pgdata/
+db/backups/
+
+# 学習データと学習結果。DB と Markdown から作り直せる
+tuning/data/
+tuning/data-labeled/
+tuning/runs/
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# 資格情報。GitHub の PAT をここに置く
+.env

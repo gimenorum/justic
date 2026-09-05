@@ -1,0 +1,11 @@
+# 学習まわり。torch は CUDA 版を別 index から入れる:
+#   pip install --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple -r requirements.txt
+torch
+transformers>=4.48.0
+accelerate
+datasets
+scikit-learn
+sentencepiece
+onnx
+onnxruntime
+psycopg[binary]

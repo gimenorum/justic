@@ -1,0 +1,20 @@
+{
+  "rules": {
+    "preset-ja-technical-writing": {
+      "ja-no-redundant-expression": {
+        "dictOptions": {
+          "dict5": { "allows": [] },
+          "dict6": { "allows": [] }
+        }
+      },
+      "sentence-length": { "max": 100 },
+      "max-ten": { "max": 3 },
+      "no-doubled-joshi": { "min_interval": 1 },
+      "no-exclamation-question-mark": false,
+      "arabic-kanji-numbers": false,
+      "ja-no-mixed-period": false,
+      "no-mix-dearu-desumasu": false
+    },
+    "@textlint-ja/textlint-rule-preset-ai-writing": true
+  }
+}

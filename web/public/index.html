@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>justic — 設計書レビュー</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>justic</h1>
+  <p class="sub">設計書をレビューする。採用と却下がそのまま学習データになる。</p>
+  <div id="stats" class="stats"></div>
+</header>
+
+<main>
+  <section class="pane">
+    <div class="pane-head">
+      <h2>設計書</h2>
+      <label class="l3"><input type="checkbox" id="useL3"> L3 (設計内容) も検査する</label>
+    </div>
+    <input id="title" placeholder="表題 (任意)">
+    <textarea id="body" spellcheck="false"></textarea>
+    <div class="actions">
+      <button id="run" class="primary">検査する</button>
+      <button id="sample" class="ghost">例文を入れる</button>
+      <span id="runState" class="state"></span>
+    </div>
+  </section>
+
+  <section class="pane">
+    <div class="pane-head">
+      <h2>指摘</h2>
+      <span id="counts" class="counts"></span>
+    </div>
+    <div id="notice" class="notice" hidden></div>
+    <div id="findings" class="findings">
+      <p class="empty">左に設計書を貼って「検査する」を押す。</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span id="health"></span>
+  <span class="hint">閉じただけのものは未判断として残る。却下にはならない。</span>
+</footer>
+
+<script src="app.js" type="module"></script>
+</body>
+</html>
