@@ -18,4 +18,9 @@ fi
 
 echo "L3: ${JUSTIC_L3:-0}  (1 で有効)"
 cd "$ROOT/web"
-exec node server.js
+# .env があれば読む (GitHub の PAT など)。node 本体の機能で、依存は増やさない。
+if [ -f "$ROOT/.env" ]; then
+    exec node --env-file="$ROOT/.env" server.js
+else
+    exec node server.js
+fi

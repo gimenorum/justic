@@ -13,12 +13,6 @@ const SAMPLE = `# 決済API 設計書
 決済処理を行うAPIを提供する。クライアントからのリクエストを受け取り、
 外部の決済ゲートウェイに転送することが可能です。
 
-## 処理の流れ
-
-1. リクエストを受け取る
-2. 決済ゲートウェイに転送する
-3. 結果を返す
-
 httpリクエストのJSONに不備があると、プロセスは黙って壊れる。
 
 ## 非機能
@@ -26,39 +20,37 @@ httpリクエストのJSONに不備があると、プロセスは黙って壊れ
 このシステムは革命的なアーキテクチャを採用しており、非常に高速に動作します。
 `;
 
-let state = { findings: [], reviewId: null };
+let mode = "paste";
+let state = { reviews: [], issueRepo: null, health: {} };
 
-async function refreshStats() {
-  try {
-    const s = await api("/api/stats");
-    $("stats").innerHTML = [
-      ["文書", s.documents], ["レビュー", s.reviews], ["提示した指摘", s.shown],
-      ["採用", s.accepted], ["却下", s.rejected],
-    ].map(([k, v]) => `${k} <b>${v}</b>`).join("");
-  } catch { /* 統計が出ないだけなので黙って続ける */ }
+// ---- 表示 -------------------------------------------------------------
+
+function allFindings() {
+  return state.reviews.flatMap((r) => r.findings);
 }
 
 function renderCounts() {
-  const decided = state.findings.filter((f) => f.verdict).length;
-  const acc = state.findings.filter((f) => f.verdict === "accepted").length;
-  const rej = state.findings.filter((f) => f.verdict === "rejected").length;
-  const undecided = state.findings.length - decided;
-  $("counts").textContent = state.findings.length
-    ? `${state.findings.length}件  採用 ${acc} / 却下 ${rej} / 未判断 ${undecided}`
+  const all = allFindings();
+  const acc = all.filter((f) => f.verdict === "accepted").length;
+  const rej = all.filter((f) => f.verdict === "rejected").length;
+  $("counts").textContent = all.length
+    ? `${all.length}件  採用 ${acc} / 却下 ${rej} / 未判断 ${all.length - acc - rej}`
     : "";
 }
 
-function card(f) {
+function findingCard(f, review) {
   const el = document.createElement("div");
   el.className = "card" + (f.verdict ? ` done-${f.verdict}` : "");
+  const ruleId = f.rule_id ?? f.ruleId ?? "";
+  const inDiff = f.in_diff;
 
-  const loc = f.line ? `L${f.line}` : "";
   el.innerHTML = `
     <div class="meta">
       <span class="badge ${f.severity}">${f.severity}</span>
       <span class="layer">${f.layer}</span>
-      <span>${loc}</span>
-      <span class="rule">${f.rule_id ?? f.ruleId ?? ""}</span>
+      <span>${f.line ? "L" + f.line : ""}</span>
+      ${inDiff === false ? '<span class="outdiff">差分の外</span>' : ""}
+      <span class="rule">${ruleId}</span>
     </div>
     <p class="msg"></p>
     ${f.evidence ? '<div class="evidence"></div>' : ""}
@@ -69,7 +61,7 @@ function card(f) {
   if (f.verdict) {
     const v = document.createElement("div");
     v.className = "verdict";
-    v.innerHTML = `<b>${f.verdict === "accepted" ? "採用" : "却下"}</b> 済み。押し直すと訂正として追記される。`;
+    v.textContent = `${f.verdict === "accepted" ? "採用" : "却下"}済み。押し直すと訂正として追記される。`;
     el.appendChild(v);
   }
 
@@ -78,11 +70,8 @@ function card(f) {
   const fix = document.createElement("input");
   fix.placeholder = "修正後の文 (採用時、任意)";
   fix.value = f.corrected_text ?? "";
-  const accept = document.createElement("button");
-  accept.textContent = "採用";
-  const reject = document.createElement("button");
-  reject.textContent = "却下";
-  reject.className = "ghost";
+  const accept = Object.assign(document.createElement("button"), { textContent: "採用" });
+  const reject = Object.assign(document.createElement("button"), { textContent: "却下", className: "ghost" });
 
   const send = async (verdict) => {
     accept.disabled = reject.disabled = true;
@@ -103,49 +92,146 @@ function card(f) {
   };
   accept.onclick = () => send("accepted");
   reject.onclick = () => send("rejected");
-
   row.append(fix, accept, reject);
+
+  if (f.verdict === "accepted" && state.health.github?.token) {
+    const issue = Object.assign(document.createElement("button"), { textContent: "issue にする", className: "ghost" });
+    issue.onclick = () => createIssue([f.id], issue, review);
+    row.appendChild(issue);
+  }
   el.appendChild(row);
   return el;
 }
 
-function render() {
-  const box = $("findings");
-  box.innerHTML = "";
-  if (state.findings.length === 0) {
-    box.innerHTML = '<p class="empty">指摘なし。該当がなければ空で返る。</p>';
+function reviewBlock(r) {
+  const wrap = document.createElement("div");
+  wrap.className = "review";
+
+  const head = document.createElement("div");
+  head.className = "review-head";
+  const accepted = r.findings.filter((f) => f.verdict === "accepted");
+  head.innerHTML = `<span class="rtitle"></span><span class="rmeta">${r.findings.length}件</span>`;
+  head.querySelector(".rtitle").textContent = r.title ?? `review ${r.reviewId}`;
+
+  if (accepted.length > 0 && state.health.github?.token) {
+    const bulk = Object.assign(document.createElement("button"), {
+      textContent: `採用${accepted.length}件を issue に`, className: "ghost small",
+    });
+    bulk.onclick = () => createIssue(accepted.map((f) => f.id), bulk, r);
+    head.appendChild(bulk);
+  }
+  wrap.appendChild(head);
+
+  if (r.issueUrl) {
+    const a = document.createElement("a");
+    a.href = r.issueUrl; a.target = "_blank"; a.className = "issue-link";
+    a.textContent = `起票済み → ${r.issueUrl.split("/").pop()}`;
+    wrap.appendChild(a);
+  }
+
+  if (r.findings.length === 0) {
+    const p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = "指摘なし。";
+    wrap.appendChild(p);
   } else {
-    for (const f of state.findings) box.appendChild(card(f));
+    for (const f of r.findings) wrap.appendChild(findingCard(f, r));
+  }
+  return wrap;
+}
+
+function render() {
+  const box = $("results");
+  box.innerHTML = "";
+  if (state.reviews.length === 0) {
+    box.innerHTML = '<p class="empty">左で対象を選んで「検査する」を押す。</p>';
+  } else {
+    for (const r of state.reviews) box.appendChild(reviewBlock(r));
   }
   renderCounts();
 }
 
-$("sample").onclick = () => {
-  $("title").value = "決済API 設計書";
-  $("body").value = SAMPLE;
+async function createIssue(findingIds, button, review) {
+  const repo = ($("issueRepo").value || state.issueRepo || "").trim();
+  if (!repo) { alert("起票先の owner/repo を入れる"); $("issueRepo").focus(); return; }
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "起票中…";
+  try {
+    const r = await api("/api/issues", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo, findingIds }),
+    });
+    review.issueUrl = r.issue.html_url;
+    render();
+    if (r.deduped) alert("同じ指摘の issue が既にある。新しくは立てなかった。");
+  } catch (e) {
+    alert(`起票できなかった: ${e.message}`);
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+// ---- 入力 -------------------------------------------------------------
+
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.onclick = () => {
+    mode = tab.dataset.mode;
+    for (const t of document.querySelectorAll(".tab")) t.classList.toggle("on", t === tab);
+    for (const m of document.querySelectorAll(".mode")) m.hidden = m.dataset.mode !== mode;
+    $("issuePanel").hidden = mode === "paste";
+  };
+}
+
+$("sample").onclick = () => { $("title").value = "決済API 設計書"; $("body").value = SAMPLE; };
+
+const ENDPOINTS = {
+  paste: () => ({ url: "/api/reviews", body: { title: $("title").value, body: $("body").value.trim() } }),
+  pr: () => ({ url: "/api/reviews/github/pr", body: { ref: $("prRef").value.trim() } }),
+  branch: () => ({
+    url: "/api/reviews/github/branch",
+    body: { ref: $("repoRef").value.trim(), prefix: $("prefix").value.trim(), maxFiles: Number($("maxFiles").value) },
+  }),
 };
 
 $("run").onclick = async () => {
-  const body = $("body").value.trim();
-  if (!body) return;
+  const { url, body } = ENDPOINTS[mode]();
+  if (!body.body && !body.ref) { $("runState").textContent = "対象が空"; return; }
+  body.useL3 = $("useL3").checked;
+
   $("run").disabled = true;
   $("runState").textContent = "検査中…";
+  $("notice").hidden = true;
   try {
-    const r = await api("/api/reviews", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ title: $("title").value, body, useL3: $("useL3").checked }),
-    });
-    state = { findings: r.findings, reviewId: r.reviewId };
+    const r = await api(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const reviews = r.reviews ?? [r];
+    state.reviews = reviews;
+
+    // 起票先の既定を、いま見ているリポジトリに合わせる。
+    const src = r.pr ?? r.repo;
+    if (src?.owner) {
+      state.issueRepo = `${src.owner}/${src.repo}`;
+      if (!$("issueRepo").value) $("issueRepo").value = state.issueRepo;
+    }
 
     const notes = [];
-    if (r.notChecked?.length) notes.push(`未検査: ${r.notChecked.join("、")}。文体が通っても設計の妥当性は見ていない。`);
-    if (r.droppedByEvidenceCheck) notes.push(`引用が原文に無い指摘を ${r.droppedByEvidenceCheck} 件破棄した。`);
-    if (r.l3Errors?.length) notes.push(`L3 でエラー: ${r.l3Errors.join(" / ")}`);
+    const notChecked = reviews.some((x) => x.notChecked?.length);
+    if (notChecked) notes.push("未検査: L3 (設計内容)。文体が通っても設計の妥当性は見ていない。");
+    const outside = reviews.reduce((n, x) => n + (x.l1OutsideDiff ?? 0), 0);
+    if (outside) notes.push(`差分の外にある文体指摘 ${outside}件は出していない (この PR が持ち込んだものではない)。`);
+    const dropped = reviews.reduce((n, x) => n + (x.droppedByEvidenceCheck ?? 0), 0);
+    if (dropped) notes.push(`引用が原文に無い指摘を ${dropped}件破棄した。`);
+    if (r.truncated) notes.push("リポジトリが大きく、一覧が途中で切れている。prefix で絞る。");
+    if (r.note) notes.push(r.note);
+    const errs = reviews.flatMap((x) => x.l3Errors ?? []);
+    if (errs.length) notes.push(`L3 でエラー: ${errs.join(" / ")}`);
     $("notice").hidden = notes.length === 0;
     $("notice").textContent = notes.join("  ");
 
-    $("runState").textContent = `検査した層: ${r.layers.join(" + ")}`;
+    $("runState").textContent = r.kind === "branch"
+      ? `${r.repo.branch} を走査。${r.scanned}/${r.total} ファイル`
+      : r.kind === "pr" ? `PR #${r.pr.number} ${reviews.length}ファイル` : `検査した層: ${reviews[0]?.layers?.join(" + ") ?? ""}`;
     render();
     refreshStats();
   } catch (e) {
@@ -155,12 +241,25 @@ $("run").onclick = async () => {
   }
 };
 
+async function refreshStats() {
+  try {
+    const s = await api("/api/stats");
+    $("stats").innerHTML = [
+      ["文書", s.documents], ["レビュー", s.reviews], ["提示した指摘", s.shown],
+      ["採用", s.accepted], ["却下", s.rejected],
+    ].map(([k, v]) => `${k} <b>${v}</b>`).join("");
+  } catch { /* 統計が出ないだけ */ }
+}
+
 (async () => {
   try {
-    const h = await api("/api/health");
-    $("health").textContent = `DB ${h.db} / L3 ${h.l3 ? "有効" : "無効"} / 観点 ${h.aspects.map((a) => a.id).join(", ")}`;
+    state.health = await api("/api/health");
+    const h = state.health;
+    $("health").textContent =
+      `DB ${h.db} / L3 ${h.l3 ? "有効" : "無効"} / GitHub token ${h.github.token ? "あり" : "なし"} / 観点 ${h.aspects.map((a) => a.id).join(", ")}`;
     $("useL3").disabled = !h.l3;
     if (!h.l3) $("useL3").parentElement.title = "JUSTIC_L3=1 で有効になる";
+    if (!h.github.token) $("issueRepo").placeholder = "JUSTIC_GITHUB_TOKEN が要る";
   } catch (e) {
     $("health").textContent = `接続できない: ${e.message}`;
   }

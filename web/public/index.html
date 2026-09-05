@@ -15,16 +15,42 @@
 
 <main>
   <section class="pane">
-    <div class="pane-head">
-      <h2>設計書</h2>
-      <label class="l3"><input type="checkbox" id="useL3"> L3 (設計内容) も検査する</label>
+    <div class="tabs" role="tablist">
+      <button class="tab on" data-mode="paste">貼り付け</button>
+      <button class="tab" data-mode="pr">PR の差分</button>
+      <button class="tab" data-mode="branch">ブランチ走査</button>
     </div>
-    <input id="title" placeholder="表題 (任意)">
-    <textarea id="body" spellcheck="false"></textarea>
+
+    <div class="mode" data-mode="paste">
+      <input id="title" placeholder="表題 (任意)">
+      <textarea id="body" spellcheck="false"></textarea>
+      <button id="sample" class="ghost small">例文を入れる</button>
+    </div>
+
+    <div class="mode" data-mode="pr" hidden>
+      <input id="prRef" placeholder="https://github.com/owner/repo/pull/12  または  owner/repo#12">
+      <p class="help">その PR が<strong>足した行</strong>の文体指摘だけを出す。もとからあった行は出さない。<br>
+        L3 (設計内容) は全文を見る。書かれていないことは差分では判定できないため。</p>
+    </div>
+
+    <div class="mode" data-mode="branch" hidden>
+      <input id="repoRef" placeholder="https://github.com/owner/repo  または  owner/repo">
+      <div class="row">
+        <input id="prefix" placeholder="パスの前方一致 (例 docs/)" style="flex:2 1 160px">
+        <input id="maxFiles" type="number" min="1" max="50" value="10" title="検査する最大ファイル数" style="flex:0 0 80px">
+      </div>
+      <p class="help">デフォルトブランチの Markdown を走査する。<strong>採用した指摘から issue を立てられる。</strong></p>
+    </div>
+
     <div class="actions">
       <button id="run" class="primary">検査する</button>
-      <button id="sample" class="ghost">例文を入れる</button>
+      <label class="l3"><input type="checkbox" id="useL3"> L3 も検査</label>
       <span id="runState" class="state"></span>
+    </div>
+
+    <div id="issuePanel" class="issue-panel" hidden>
+      <label>起票先 <input id="issueRepo" placeholder="owner/repo"></label>
+      <p class="help">採用した指摘だけが起票される。同じ指摘からは二度立たない。</p>
     </div>
   </section>
 
@@ -34,8 +60,8 @@
       <span id="counts" class="counts"></span>
     </div>
     <div id="notice" class="notice" hidden></div>
-    <div id="findings" class="findings">
-      <p class="empty">左に設計書を貼って「検査する」を押す。</p>
+    <div id="results" class="findings">
+      <p class="empty">左で対象を選んで「検査する」を押す。</p>
     </div>
   </section>
 </main>

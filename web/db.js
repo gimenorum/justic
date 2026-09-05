@@ -24,11 +24,12 @@ export async function upsertDocument(title, body) {
   return rows[0];
 }
 
-export async function createReview(documentId, { profile, layers, l3ModelId, promptVersion, classifierRun }) {
+export async function createReview(documentId, { profile, layers, l3ModelId, promptVersion, classifierRun, sourceKind, sourceRef }) {
   const { rows } = await pool.query(
-    `insert into reviews (document_id, profile, layers, l3_model_id, prompt_version, classifier_run)
-     values ($1, $2, $3, $4, $5, $6) returning id, started_at`,
-    [documentId, profile ?? "default", layers, l3ModelId ?? null, promptVersion ?? null, classifierRun ?? null],
+    `insert into reviews (document_id, profile, layers, l3_model_id, prompt_version, classifier_run, source_kind, source_ref)
+     values ($1, $2, $3, $4, $5, $6, $7, $8) returning id, started_at`,
+    [documentId, profile ?? "default", layers, l3ModelId ?? null, promptVersion ?? null, classifierRun ?? null,
+     sourceKind ?? "paste", sourceRef ? JSON.stringify(sourceRef) : null],
   );
   return rows[0];
 }
@@ -40,13 +41,13 @@ export async function insertFindings(reviewId, findings) {
     const { rows } = await pool.query(
       `insert into findings
          (review_id, rule_id, layer, severity, line, col, end_line, end_col,
-          message, evidence, suggestion, confidence, exposure, shown_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning *`,
+          message, evidence, suggestion, confidence, exposure, shown_at, in_diff)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning *`,
       [
         reviewId, f.ruleId, f.layer, f.severity,
         f.line ?? null, f.col ?? null, f.endLine ?? null, f.endCol ?? null,
         f.message, f.evidence ?? null, f.suggestion ?? null, f.confidence ?? null,
-        f.exposure, f.exposure === "hidden" ? null : new Date(),
+        f.exposure, f.exposure === "hidden" ? null : new Date(), f.inDiff ?? null,
       ],
     );
     out.push(rows[0]);
@@ -114,6 +115,51 @@ export async function stats() {
        (select count(*) from current_verdicts where verdict='rejected') as rejected`,
   );
   return rows[0];
+}
+
+/** 起票の対象。採用されたものだけを返す。未判断や却下は起票しない。 */
+export async function acceptedFindings(findingIds) {
+  const { rows } = await pool.query(
+    `select f.id, f.rule_id, f.layer, f.severity, f.line, f.message, f.evidence, f.in_diff,
+            v.corrected_text, r.source_kind, r.source_ref, d.title as document_title
+     from findings f
+     join current_verdicts v on v.finding_id = f.id and v.verdict = 'accepted'
+     join reviews r   on r.id = f.review_id
+     join documents d on d.id = r.document_id
+     where f.id = any($1::bigint[])
+     order by f.line nulls last, f.id`,
+    [findingIds],
+  );
+  return rows;
+}
+
+export async function findIssue(owner, repo, marker) {
+  const { rows } = await pool.query(
+    `select * from github_issues where owner = $1 and repo = $2 and marker = $3`,
+    [owner, repo, marker],
+  );
+  return rows[0] ?? null;
+}
+
+export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds }) {
+  const { rows } = await pool.query(
+    `insert into github_issues (owner, repo, number, html_url, title, marker, finding_ids)
+     values ($1,$2,$3,$4,$5,$6,$7)
+     on conflict (owner, repo, marker) do nothing
+     returning *`,
+    [owner, repo, number, htmlUrl, title, marker, findingIds],
+  );
+  return rows[0] ?? (await findIssue(owner, repo, marker));
+}
+
+export async function issuesForReview(reviewId) {
+  const { rows } = await pool.query(
+    `select distinct i.* from github_issues i
+     join findings f on f.id = any(i.finding_ids)
+     where f.review_id = $1 order by i.created_at desc`,
+    [reviewId],
+  );
+  return rows;
 }
 
 export async function ping() {
