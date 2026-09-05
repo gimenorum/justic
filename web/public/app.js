@@ -251,15 +251,48 @@ async function refreshStats() {
   } catch { /* 統計が出ないだけ */ }
 }
 
+function renderAccount(h) {
+  const box = $("account");
+  box.innerHTML = "";
+  if (h.me) {
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = `@${h.me.login}`;
+    const out = Object.assign(document.createElement("button"), { textContent: "ログアウト", className: "ghost small" });
+    out.onclick = async () => { await fetch("/auth/logout", { method: "POST" }); location.reload(); };
+    box.append(who, out);
+    return;
+  }
+  if (h.github.oauth) {
+    const a = document.createElement("a");
+    a.href = "/auth/login";
+    a.className = "login";
+    a.textContent = "GitHub でログイン";
+    box.appendChild(a);
+    if (h.github.token) {
+      const note = document.createElement("span");
+      note.className = "who";
+      note.textContent = ".env の PAT で動作中";
+      box.appendChild(note);
+    }
+  } else {
+    const note = document.createElement("span");
+    note.className = "who";
+    note.textContent = h.github.token ? ".env の PAT で動作中 (一人用)" : "GitHub 未接続";
+    box.appendChild(note);
+  }
+}
+
 (async () => {
   try {
     state.health = await api("/api/health");
     const h = state.health;
+    renderAccount(h);
     $("health").textContent =
-      `DB ${h.db} / L3 ${h.l3 ? "有効" : "無効"} / GitHub token ${h.github.token ? "あり" : "なし"} / 観点 ${h.aspects.map((a) => a.id).join(", ")}`;
+      `DB ${h.db} / L3 ${h.l3 ? "有効" : "無効"} / GitHub ${h.github.viaLogin ? "ログイン中" : h.github.token ? ".env の PAT" : "未接続"} / 観点 ${h.aspects.map((a) => a.id).join(", ")}`;
     $("useL3").disabled = !h.l3;
     if (!h.l3) $("useL3").parentElement.title = "JUSTIC_L3=1 で有効になる";
-    if (!h.github.token) $("issueRepo").placeholder = "JUSTIC_GITHUB_TOKEN が要る";
+    if (!h.github.token) $("issueRepo").placeholder = "GitHub にログインすると起票できる";
   } catch (e) {
     $("health").textContent = `接続できない: ${e.message}`;
   }

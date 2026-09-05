@@ -88,3 +88,11 @@ footer { border-top: 1px solid var(--line); padding: 10px 24px; display: flex; g
 .review .card { margin-bottom: 8px; }
 .outdiff { border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; color: var(--muted); }
 .issue-link { display: inline-block; margin-bottom: 8px; font-size: 12px; color: var(--accent); }
+
+/* 誰が使っているか */
+.head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.account { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.who { color: var(--muted); }
+.login { display: inline-block; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--accent);
+         color: var(--accent); text-decoration: none; font-weight: 600; }
+.login:hover { background: var(--accent); color: #fff; }

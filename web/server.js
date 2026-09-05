@@ -4,12 +4,14 @@ import express from "express";
 
 import * as db from "./db.js";
 import * as gh from "./github.js";
+import * as auth from "./auth.js";
 import { lintMarkdown } from "./lint.js";
 import { l3Enabled, runL3, ASPECTS } from "./llm.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.PORT ?? 5180);
+const ORIGIN = process.env.JUSTIC_ORIGIN ?? `http://127.0.0.1:${PORT}`;
 
 app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(here, "public")));
@@ -18,6 +20,43 @@ const wrap = (fn) => (req, res) => fn(req, res).catch((e) => {
   console.error(e);
   res.status(500).json({ error: String(e.message ?? e) });
 });
+
+// 押した本人。ログインしていなければ 'local' に落ちる (一人で使うとき)。
+function actor(req) {
+  const s = auth.sessionOf(req);
+  return { userId: s?.userId ?? null, decidedBy: s?.login ?? "local" };
+}
+
+// ---- 認証 --------------------------------------------------------------
+
+app.get("/auth/login", (req, res) => {
+  if (!auth.oauthConfigured()) {
+    return res.status(400).send("OAuth が未設定。JUSTIC_OAUTH_CLIENT_ID / _SECRET / JUSTIC_SESSION_SECRET を .env に入れる");
+  }
+  res.redirect(auth.authorizeUrl(auth.makeState()));
+});
+
+app.get("/auth/callback", wrap(async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !auth.checkState(String(state ?? ""))) {
+    return res.status(400).send("state が合わない。やり直す");
+  }
+  const token = await auth.exchangeCode(String(code));
+  const viewer = await auth.fetchViewer(token);
+  const user = await db.upsertUser(viewer);
+  // トークンは cookie の中だけ。DB には保存しない。
+  auth.setSession(res, { userId: Number(user.id), login: user.login, token });
+  res.redirect("/");
+}));
+
+app.post("/auth/logout", (req, res) => { auth.clearSession(res); res.json({ ok: true }); });
+
+app.get("/api/me", wrap(async (req, res) => {
+  const s = auth.sessionOf(req);
+  res.json(s ? { login: s.login, userId: s.userId } : null);
+}));
+
+// ---- レビュー ----------------------------------------------------------
 
 /**
  * 1文書を検査して保存する。
@@ -71,12 +110,19 @@ async function reviewOne(bodyText, { title, useL3, sourceKind = "paste", sourceR
   };
 }
 
-app.get("/api/health", wrap(async (_req, res) => {
+app.get("/api/health", wrap(async (req, res) => {
   await db.ping();
+  const s = auth.sessionOf(req);
   res.json({
     db: "ok",
     l3: l3Enabled(),
-    github: { token: gh.hasToken() },
+    github: {
+      // ログインしていればその人のトークン、していなければ .env の PAT
+      token: gh.hasToken(s?.token),
+      viaLogin: Boolean(s?.token),
+      oauth: auth.oauthConfigured(),
+    },
+    me: s ? { login: s.login, userId: s.userId } : null,
     aspects: ASPECTS.map((a) => ({ id: a.id, title: a.title })),
   });
 }));
@@ -97,15 +143,15 @@ app.post("/api/reviews", wrap(async (req, res) => {
   res.json(await reviewOne(body, { title, useL3: req.body?.useL3 }));
 }));
 
-// PR の差分をレビューする。
 app.post("/api/reviews/github/pr", wrap(async (req, res) => {
   const ref = gh.parsePullRef(req.body?.ref);
   if (!ref) return res.status(400).json({ error: "PR の URL か owner/repo#番号 を渡す" });
+  const token = auth.tokenFor(req);
 
-  const pr = await gh.getPull(ref.owner, ref.repo, ref.number);
-  const files = await gh.getMarkdownFiles(ref.owner, ref.repo, ref.number, { headSha: pr.headSha });
+  const pr = await gh.getPull(ref.owner, ref.repo, ref.number, { token });
+  const files = await gh.getMarkdownFiles(ref.owner, ref.repo, ref.number, { headSha: pr.headSha, token });
   if (files.length === 0) {
-    return res.json({ kind: "pr", pr, reviews: [], note: "この PR は Markdown を変更していない" });
+    return res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews: [], note: "この PR は Markdown を変更していない" });
   }
 
   const reviews = [];
@@ -121,22 +167,23 @@ app.post("/api/reviews/github/pr", wrap(async (req, res) => {
   res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews });
 }));
 
-// デフォルトブランチを走査する。差分ではないので全文が対象。
 app.post("/api/reviews/github/branch", wrap(async (req, res) => {
   const ref = gh.parseRepoRef(req.body?.ref);
   if (!ref) return res.status(400).json({ error: "リポジトリの URL か owner/repo を渡す" });
+  const token = auth.tokenFor(req);
 
-  const repo = await gh.getRepo(ref.owner, ref.repo);
+  const repo = await gh.getRepo(ref.owner, ref.repo, { token });
   const branch = req.body?.branch || repo.defaultBranch;
   const { paths, total, truncated } = await gh.listMarkdown(ref.owner, ref.repo, branch, {
     maxFiles: Math.min(Number(req.body?.maxFiles ?? 10), 50),
     prefix: req.body?.prefix ?? "",
+    token,
   });
   if (paths.length === 0) return res.json({ kind: "branch", repo: { ...ref, branch }, reviews: [], note: "Markdown が無い" });
 
   const reviews = [];
   for (const p of paths) {
-    const body = await gh.getFile(ref.owner, ref.repo, p, branch);
+    const body = await gh.getFile(ref.owner, ref.repo, p, branch, { token });
     reviews.push(await reviewOne(body, {
       title: `${ref.owner}/${ref.repo}:${branch} ${p}`,
       useL3: req.body?.useL3,
@@ -144,12 +191,7 @@ app.post("/api/reviews/github/branch", wrap(async (req, res) => {
       sourceRef: { ...ref, ref: branch, path: p, html_url: `${repo.htmlUrl}/blob/${branch}/${p}` },
     }));
   }
-  res.json({
-    kind: "branch",
-    repo: { ...ref, branch, hasIssues: repo.hasIssues },
-    scanned: paths.length, total, truncated,
-    reviews,
-  });
+  res.json({ kind: "branch", repo: { ...ref, branch, hasIssues: repo.hasIssues }, scanned: paths.length, total, truncated, reviews });
 }));
 
 app.post("/api/findings/:id/verdict", wrap(async (req, res) => {
@@ -157,11 +199,12 @@ app.post("/api/findings/:id/verdict", wrap(async (req, res) => {
   if (verdict !== "accepted" && verdict !== "rejected") {
     return res.status(400).json({ error: "verdict は accepted か rejected" });
   }
+  const who = actor(req);
   const row = await db.addVerdict(Number(req.params.id), {
     verdict,
     correctedText: req.body?.correctedText,
     note: req.body?.note,
-    decidedBy: req.body?.decidedBy ?? "local",
+    ...who,
   });
   res.json(row);
 }));
@@ -169,16 +212,17 @@ app.post("/api/findings/:id/verdict", wrap(async (req, res) => {
 // 採用された指摘から issue を立てる。
 // 未判断のものからは立てない。LLM の出力をそのまま起票すると repo が荒れる。
 app.post("/api/issues", wrap(async (req, res) => {
-  if (!gh.hasToken()) return res.status(400).json({ error: "起票には JUSTIC_GITHUB_TOKEN が要る (issues: write)" });
+  const token = auth.tokenFor(req);
+  if (!gh.hasToken(token)) {
+    return res.status(401).json({ error: "起票には GitHub のログインが要る" });
+  }
   const target = gh.parseRepoRef(req.body?.repo);
   if (!target) return res.status(400).json({ error: "repo は owner/repo で渡す" });
   const ids = (req.body?.findingIds ?? []).map(Number).filter(Number.isFinite);
   if (ids.length === 0) return res.status(400).json({ error: "findingIds が空" });
 
   const rows = await db.acceptedFindings(ids);
-  if (rows.length === 0) {
-    return res.status(400).json({ error: "採用された指摘がない。先に採用を押す" });
-  }
+  if (rows.length === 0) return res.status(400).json({ error: "採用された指摘がない。先に採用を押す" });
 
   const first = rows[0];
   const srcPath = first.source_ref?.path ?? first.document_title ?? "文書";
@@ -206,15 +250,15 @@ app.post("/api/issues", wrap(async (req, res) => {
   lines.push(`<!-- ${gh.MARKER_PREFIX}${marker} -->`);
 
   const created = await gh.createIssue(target.owner, target.repo, {
-    title, body: lines.join("\n"), labels: req.body?.labels ?? [],
+    title, body: lines.join("\n"), labels: req.body?.labels ?? [], token,
   });
   const saved = await db.recordIssue(target.owner, target.repo, {
-    ...created, marker, findingIds: rows.map((r) => Number(r.id)),
+    ...created, marker, findingIds: rows.map((r) => Number(r.id)), userId: actor(req).userId,
   });
   res.json({ issue: saved, deduped: false, from: rows.length });
 }));
 
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`justic  http://127.0.0.1:${PORT}`);
-  console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=1)"}   GitHub token: ${gh.hasToken() ? "あり" : "なし"}`);
+  console.log(`justic  ${ORIGIN}`);
+  console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=1)"}   OAuth: ${auth.oauthConfigured() ? "設定済み" : "未設定"}   .env の PAT: ${gh.envToken() ? "あり" : "なし"}`);
 });

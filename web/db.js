@@ -59,12 +59,25 @@ export async function finishReview(reviewId) {
   await pool.query(`update reviews set finished_at = now() where id = $1`, [reviewId]);
 }
 
-// 採否は追記のみ。押し直しても前の行は消さない。
-export async function addVerdict(findingId, { verdict, correctedText, note, decidedBy }) {
+export async function upsertUser({ githubId, login, name, avatarUrl }) {
   const { rows } = await pool.query(
-    `insert into verdicts (finding_id, verdict, corrected_text, note, decided_by)
-     values ($1, $2, $3, $4, $5) returning *`,
-    [findingId, verdict, correctedText || null, note || null, decidedBy || "local"],
+    `insert into users (github_id, login, name, avatar_url)
+     values ($1, $2, $3, $4)
+     on conflict (github_id) do update
+       set login = excluded.login, name = excluded.name,
+           avatar_url = excluded.avatar_url, last_seen_at = now()
+     returning id, github_id, login, name, avatar_url`,
+    [githubId, login, name ?? null, avatarUrl ?? null],
+  );
+  return rows[0];
+}
+
+// 採否は追記のみ。押し直しても前の行は消さない。
+export async function addVerdict(findingId, { verdict, correctedText, note, decidedBy, userId }) {
+  const { rows } = await pool.query(
+    `insert into verdicts (finding_id, verdict, corrected_text, note, decided_by, user_id)
+     values ($1, $2, $3, $4, $5, $6) returning *`,
+    [findingId, verdict, correctedText || null, note || null, decidedBy || "local", userId ?? null],
   );
   return rows[0];
 }
@@ -141,13 +154,13 @@ export async function findIssue(owner, repo, marker) {
   return rows[0] ?? null;
 }
 
-export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds }) {
+export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds, userId }) {
   const { rows } = await pool.query(
-    `insert into github_issues (owner, repo, number, html_url, title, marker, finding_ids)
-     values ($1,$2,$3,$4,$5,$6,$7)
+    `insert into github_issues (owner, repo, number, html_url, title, marker, finding_ids, user_id)
+     values ($1,$2,$3,$4,$5,$6,$7,$8)
      on conflict (owner, repo, marker) do nothing
      returning *`,
-    [owner, repo, number, htmlUrl, title, marker, findingIds],
+    [owner, repo, number, htmlUrl, title, marker, findingIds, userId ?? null],
   );
   return rows[0] ?? (await findIssue(owner, repo, marker));
 }

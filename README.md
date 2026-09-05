@@ -29,7 +29,21 @@ L3 (設計内容) は差分では判定できない。「異常系が書かれ�
 起票は**採用された指摘からだけ**行う。未判断の LLM 出力をそのまま issue にすると repo が荒れる。
 同じ指摘から二度立たないよう、本文に `<!-- justic:... -->` の鍵を埋めて `github_issues` で突き合わせる。
 
-GitHub の PAT は `.env` に置く (`.env.example` を参照)。DB にも画面にも渡さない。
+## 誰が使うか
+
+| 使い方 | 設定 | 誰として記録されるか |
+|---|---|---|
+| 一人 | `.env` に `JUSTIC_GITHUB_TOKEN` | `local` |
+| 複数 | GitHub OAuth | ログインした本人 |
+
+複数人で使うなら OAuth を設定する。`.env` の PAT は1本しか置けないので、
+採否を押した本人が残らず、issue も PAT の持ち主として立つ。
+
+**アクセストークンは DB に置かない。** AES-256-GCM で封をした httpOnly cookie に入れて
+ブラウザに持たせる。DB の控えが漏れても資格情報は出ない。鍵は `JUSTIC_SESSION_SECRET`。
+
+OAuth App は GitHub の Settings > Developer settings で作る。
+callback は `http://127.0.0.1:5180/auth/callback`。
 
 ## 構成
 
