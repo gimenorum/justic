@@ -118,22 +118,109 @@ async function annotationPanel(reviewId) {
   let data = await api(`/api/documents/${docId}/annotations`);
   const aspectId = state.health.aspects?.[0]?.id ?? "D-01";
   const lines = String(full.body ?? "").split("\n");
+  const findingLines = new Set(full.findings.map((f) => f.line).filter(Boolean));
   let sel = null;   // {start, end}
 
-  const findingLines = new Set(full.findings.map((f) => f.line).filter(Boolean));
+  // 骨格は一度だけ作る。クリックのたびに作り直すと、本文のスクロール位置も
+  // 入力中の文字も消える。更新は必要な部分だけ差し替える。
+  panel.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "annot-head";
+  const runs = document.createElement("div");
+  runs.className = "aspect-runs";
+  const body = document.createElement("div");
+  body.className = "annot-body";
+  const bar = document.createElement("div");
+  bar.className = "annot-list";
+  bar.hidden = true;
+  const list = document.createElement("div");
+  list.className = "annot-list";
+  panel.append(head, runs, body, bar, list);
 
-  function draw() {
-    panel.innerHTML = "";
-    const live = data.annotations.filter((a) => !a.retracted);
+  // ---- 選択の帯。入力欄は作り直さない (打ちかけが消えるため) ----
+  const quote = document.createElement("div");
+  quote.className = "annot-item";
+  const note = Object.assign(document.createElement("input"), { placeholder: "何が問題か (任意)" });
+  const add = Object.assign(document.createElement("button"), { textContent: "ここが問題", className: "primary small" });
+  const clear = Object.assign(document.createElement("button"), { textContent: "選択解除", className: "ghost small" });
+  const row = document.createElement("div");
+  row.className = "row";
+  row.append(note, add, clear);
+  bar.append(quote, row);
+
+  clear.onclick = () => { sel = null; paintSelection(); };
+  add.onclick = async () => {
+    if (!sel) return;
+    add.disabled = true;
+    try {
+      await api(`/api/documents/${docId}/annotations`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          startLine: sel.start, endLine: sel.end,
+          quotedText: lines.slice(sel.start - 1, sel.end).join("\n"),
+          note: note.value,
+        }),
+      });
+      sel = null;
+      note.value = "";
+      data = await api(`/api/documents/${docId}/annotations`);
+      paintSelection(); paintMarks(); renderList(); renderHead(); refreshStats();
+    } catch (e) { alert(needLogin(e)); }
+    add.disabled = false;
+  };
+
+  // ---- 本文。行の要素は一度だけ作る ----
+  const lineEls = lines.map((text, i) => {
+    const n = i + 1;
+    const el = document.createElement("div");
+    el.className = "ln";
+    el.innerHTML = '<span class="num"></span><span class="txt"></span>';
+    el.querySelector(".num").textContent = n;
+    el.querySelector(".txt").textContent = text || " ";
+    el.onclick = (ev) => {
+      // 本文をドラッグして選んでいる最中は行選択を変えない。
+      // 変えてしまうと、問題文を引用のためになぞって選ぶことができない。
+      const picked = window.getSelection();
+      if (picked && !picked.isCollapsed && picked.toString().trim()) return;
+      // 既に選んでいる行を押し直したときは、入力を初期化しない
+      if (!ev.shiftKey && sel && n >= sel.start && n <= sel.end) return;
+      sel = ev.shiftKey && sel
+        ? { start: Math.min(sel.start, n), end: Math.max(sel.end, n) }
+        : { start: n, end: n };
+      paintSelection();
+    };
+    body.appendChild(el);
+    return el;
+  });
+
+  // ---- 差分更新 ----
+  function paintSelection() {
+    lineEls.forEach((el, i) => {
+      const n = i + 1;
+      el.classList.toggle("sel", Boolean(sel) && n >= sel.start && n <= sel.end);
+    });
+    bar.hidden = !sel;
+    if (sel) {
+      const text = lines.slice(sel.start - 1, sel.end).join(" / ").trim();
+      quote.textContent = `L${sel.start}-${sel.end}  ${text.slice(0, 90)}`;
+    }
+  }
+
+  function paintMarks() {
     const annotLines = new Set();
-    for (const a of live) for (let i = a.start_line; i <= a.end_line; i += 1) annotLines.add(i);
+    for (const a of data.annotations.filter((a) => !a.retracted)) {
+      for (let i = a.start_line; i <= a.end_line; i += 1) annotLines.add(i);
+    }
+    lineEls.forEach((el, i) => {
+      el.classList.toggle("has-annot", annotLines.has(i + 1));
+      el.classList.toggle("has-finding", findingLines.has(i + 1));
+    });
+  }
+
+  function renderHead() {
     const done = data.completions.some((c) => c.aspect_id === aspectId && !c.revoked_at);
-
-    const head = document.createElement("div");
-    head.className = "annot-head";
     head.innerHTML = `<span class="grow">本文 ${lines.length} 行
-      <span class="who">行をクリックで選択、Shift+クリックで範囲</span></span>`;
-
+      <span class="who">行をクリックで選択、Shift+クリックで範囲。本文はなぞって引用できる</span></span>`;
     const mark = Object.assign(document.createElement("button"), {
       textContent: done ? `✓ ${aspectId} は全部見た` : `${aspectId} を全部見た`,
       className: done ? "small" : "ghost small",
@@ -150,98 +237,49 @@ async function annotationPanel(reviewId) {
           });
         }
         data = await api(`/api/documents/${docId}/annotations`);
-        draw(); refreshStats();
+        renderHead(); refreshStats();
       } catch (e) { alert(needLogin(e)); }
     };
     head.appendChild(mark);
-    panel.appendChild(head);
+  }
 
-    if (full.aspectRuns?.length) {
-      const runs = document.createElement("div");
-      runs.className = "aspect-runs";
-      runs.innerHTML = "走った観点: " + full.aspectRuns.map((r) =>
-        `<span class="st-${r.status}">${r.aspect_id} ${r.status}${r.error ? " — " + r.error.slice(0, 40) : ""}</span>`
-      ).join(" / ");
-      panel.appendChild(runs);
-    }
-
-    const body = document.createElement("div");
-    body.className = "annot-body";
-    lines.forEach((text, i) => {
-      const n = i + 1;
-      const el = document.createElement("div");
-      el.className = "ln"
-        + (annotLines.has(n) ? " has-annot" : "")
-        + (findingLines.has(n) ? " has-finding" : "")
-        + (sel && n >= sel.start && n <= sel.end ? " sel" : "");
-      el.innerHTML = '<span class="num"></span><span class="txt"></span>';
-      el.querySelector(".num").textContent = n;
-      el.querySelector(".txt").textContent = text || " ";
-      el.onclick = (ev) => {
-        sel = ev.shiftKey && sel
-          ? { start: Math.min(sel.start, n), end: Math.max(sel.end, n) }
-          : { start: n, end: n };
-        draw();
+  function renderList() {
+    list.innerHTML = "";
+    list.hidden = data.annotations.length === 0;
+    for (const a of data.annotations) {
+      const item = document.createElement("div");
+      item.className = "annot-item" + (a.retracted ? " gone" : "");
+      item.innerHTML = `<span>L${a.start_line}-${a.end_line}</span>
+        <span class="q"></span><span>${a.aspect_id ?? "未分類"} / @${a.author}</span>`;
+      item.querySelector(".q").textContent = (a.note || a.quoted_text).slice(0, 60);
+      // 一覧から本文の該当行へ飛ぶ。押しても本文の先頭には戻らない
+      item.querySelector(".q").style.cursor = "pointer";
+      item.querySelector(".q").onclick = () => {
+        lineEls[a.start_line - 1]?.scrollIntoView({ block: "center", behavior: "smooth" });
       };
-      body.appendChild(el);
-    });
-    panel.appendChild(body);
-
-    if (sel) {
-      const bar = document.createElement("div");
-      bar.className = "annot-list";
-      const quoted = lines.slice(sel.start - 1, sel.end).join("\n");
-      const note = Object.assign(document.createElement("input"), { placeholder: "何が問題か (任意)" });
-      const add = Object.assign(document.createElement("button"), { textContent: "ここが問題", className: "primary small" });
-      add.onclick = async () => {
-        add.disabled = true;
+      const undo = Object.assign(document.createElement("button"), {
+        textContent: a.retracted ? "戻す" : "取消", className: "ghost small",
+      });
+      undo.onclick = async () => {
         try {
-          await api(`/api/documents/${docId}/annotations`, {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ startLine: sel.start, endLine: sel.end, quotedText: quoted, note: note.value }),
-          });
-          sel = null;
+          await api(`/api/annotations/${a.id}/${a.retracted ? "restore" : "retract"}`,
+            { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
           data = await api(`/api/documents/${docId}/annotations`);
-          draw(); refreshStats();
-        } catch (e) { alert(needLogin(e)); add.disabled = false; }
+          paintMarks(); renderList(); refreshStats();
+        } catch (e) { alert(needLogin(e)); }
       };
-      const row = document.createElement("div");
-      row.className = "row";
-      row.append(note, add);
-      bar.append(Object.assign(document.createElement("div"), {
-        className: "annot-item", textContent: `L${sel.start}-${sel.end} を選択中`,
-      }), row);
-      panel.appendChild(bar);
-    }
-
-    if (data.annotations.length) {
-      const list = document.createElement("div");
-      list.className = "annot-list";
-      for (const a of data.annotations) {
-        const item = document.createElement("div");
-        item.className = "annot-item" + (a.retracted ? " gone" : "");
-        item.innerHTML = `<span>L${a.start_line}-${a.end_line}</span>
-          <span class="q"></span><span>${a.aspect_id ?? "未分類"} / @${a.author}</span>`;
-        item.querySelector(".q").textContent = (a.note || a.quoted_text).slice(0, 60);
-        const undo = Object.assign(document.createElement("button"), {
-          textContent: a.retracted ? "戻す" : "取消", className: "ghost small",
-        });
-        undo.onclick = async () => {
-          try {
-            await api(`/api/annotations/${a.id}/${a.retracted ? "restore" : "retract"}`,
-              { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-            data = await api(`/api/documents/${docId}/annotations`);
-            draw(); refreshStats();
-          } catch (e) { alert(needLogin(e)); }
-        };
-        item.appendChild(undo);
-        list.appendChild(item);
-      }
-      panel.appendChild(list);
+      item.appendChild(undo);
+      list.appendChild(item);
     }
   }
 
-  draw();
+  runs.hidden = !full.aspectRuns?.length;
+  if (full.aspectRuns?.length) {
+    runs.innerHTML = "走った観点: " + full.aspectRuns.map((r) =>
+      `<span class="st-${r.status}">${r.aspect_id} ${r.status}${r.error ? " — " + r.error.slice(0, 40) : ""}</span>`
+    ).join(" / ");
+  }
+  renderHead(); paintMarks(); renderList(); paintSelection();
   return panel;
 }
 
