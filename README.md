@@ -3,7 +3,13 @@
 生成モデルが書いた設計書をレビューし、**指摘の採用と却下がそのまま学習データになる**仕組み。
 
 検出対象は2つ。**設計内容の欠陥**と**直訳調の日本語**。
-要件は [docs/design-review-api-requirements-v2.md](docs/design-review-api-requirements-v2.md) を参照。
+
+| 文書 | 中身 |
+|---|---|
+| [要件](docs/design-review-api-requirements-v2.md) | 層の構成、検出対象、評価。草案は [こちら](docs/design-review-api-requirements.md) |
+| [追加設計の地図](docs/design-00-overview.md) | 4本への分割、依存の順序、共通の決定 |
+| [01 測定](docs/design-01-measurement.md) | 未検知の記録と recall。**書いた** |
+| [02 実行基盤](docs/design-02-runtime.md) / [03 入力](docs/design-03-input.md) / [04 観点](docs/design-04-aspects.md) | 未着手。解くべき問題の一覧 |
 
 ## 起動
 
