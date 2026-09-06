@@ -203,22 +203,36 @@ export async function acceptedFindings(findingIds) {
   return rows;
 }
 
-/** 鍵をまとめて引く。押す前に「もう立っている」を出すために要る。 */
+/**
+ * 鍵ごとに最後に立てた issue を引く。押す前に「もう立っている」を出すために要る。
+ *
+ * marker は「どの問題か」を指すもので、issue そのものではない。
+ * 同じ問題が再発すれば issue は複数あるので、最新を見る。
+ */
 export async function findIssuesByMarkers(owner, repo, markers) {
   if (!markers.length) return new Map();
   const { rows } = await pool.query(
-    `select marker, number, html_url from github_issues
-     where owner = $1 and repo = $2 and marker = any($3::text[])`,
+    `select distinct on (marker) marker, id, number, html_url, state, state_checked_at
+     from github_issues
+     where owner = $1 and repo = $2 and marker = any($3::text[])
+     order by marker, created_at desc, id desc`,
     [owner, repo, markers]);
   return new Map(rows.map((r) => [r.marker, r]));
 }
 
 export async function findIssue(owner, repo, marker) {
   const { rows } = await pool.query(
-    `select * from github_issues where owner = $1 and repo = $2 and marker = $3`,
+    `select * from github_issues where owner = $1 and repo = $2 and marker = $3
+     order by created_at desc, id desc limit 1`,
     [owner, repo, marker],
   );
   return rows[0] ?? null;
+}
+
+export async function updateIssueState(id, state) {
+  await pool.query(
+    `update github_issues set state = $2, state_checked_at = now() where id = $1`,
+    [id, state]);
 }
 
 export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds, annotationIds, userId }) {
@@ -226,11 +240,10 @@ export async function recordIssue(owner, repo, { number, htmlUrl, title, marker,
     `insert into github_issues
        (owner, repo, number, html_url, title, marker, finding_ids, annotation_ids, user_id)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     on conflict (owner, repo, marker) do nothing
      returning *`,
     [owner, repo, number, htmlUrl, title, marker, findingIds ?? [], annotationIds ?? [], userId ?? null],
   );
-  return rows[0] ?? (await findIssue(owner, repo, marker));
+  return rows[0];
 }
 
 export async function issuesForReview(reviewId) {

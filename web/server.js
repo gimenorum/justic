@@ -306,8 +306,8 @@ app.post("/api/issues", wrap(async (req, res) => {
     evidence: rows.map((r) => r.evidence ?? r.message).join("\n"),
   });
 
-  const existing = await db.findIssue(target.owner, target.repo, marker);
-  if (existing) return res.json({ issue: existing, deduped: true });
+  const { issue: prev, open } = await issueStateFor(target, marker, token);
+  if (open) return res.json({ issue: prev, deduped: true });
 
   // 指摘文をそのまま入れると一覧で読めない。最初の一文だけを切り出し、
   // 場所とルール名を添える。詳細は本文にある。
@@ -321,6 +321,7 @@ app.post("/api/issues", wrap(async (req, res) => {
     : `[レビュー] ${srcPath}: ${rows.length}件の指摘`;
 
   const lines = [`\`${srcPath}\` のレビューで採用された指摘。`, ""];
+  if (prev) lines.push(`以前 #${prev.number} として起票され、閉じられている。再発として立てた。`, "");
   for (const r of rows) {
     lines.push(`### ${r.line ? `L${r.line} ` : ""}${r.rule_id}`, "");
     lines.push(r.message, "");
@@ -358,9 +359,14 @@ app.get("/api/documents/:id/annotations", wrap(async (req, res) => {
   if (target && annotations.length) {
     const markers = annotations.map((a) => annotationMarker(target, a));
     const found = await db.findIssuesByMarkers(target.owner, target.repo, markers);
+    await refreshStaleStates(target, [...found.values()], auth.tokenFor(req));
     annotations.forEach((a, i) => {
       const hit = found.get(markers[i]);
-      if (hit && !a.issue_url) { a.issue_url = hit.html_url; a.issue_number = hit.number; }
+      if (!hit) return;
+      a.issue_url = hit.html_url;
+      a.issue_number = hit.number;
+      // 閉じているなら再発として立て直せる
+      a.issue_state = hit.state;
     });
   }
   res.json({ annotations, completions: await db.listCompletions(documentId) });
@@ -416,6 +422,25 @@ app.post("/api/documents/:id/completions", wrap(async (req, res) => {
   res.json(await db.addCompletion(Number(req.params.id), aspectId, s.userId));
 }));
 
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 記録している状態が古いものだけ GitHub に引き直す。
+ * 一覧を開くたびに全件叩くとレート制限をすぐ使い切る。
+ */
+async function refreshStaleStates(target, issues, token) {
+  const stale = issues.filter((i) =>
+    !i.state_checked_at || Date.now() - new Date(i.state_checked_at).getTime() > STATE_TTL_MS);
+  for (const i of stale.slice(0, 10)) {
+    try {
+      const live = await gh.getIssue(target.owner, target.repo, i.number, { token });
+      // 変わっていなくても確認した時刻は残す。残さないと TTL が効かず毎回叩く
+      await db.updateIssueState(i.id, live.state);
+      i.state = live.state;
+    } catch { /* 届かなければ記録している状態のまま */ }
+  }
+}
+
 /**
  * 起票済みかをまとめて引く。押してから「もうある」と言われないようにする。
  * 鍵はサーバー側の値から作るので、クライアントには計算できない。
@@ -433,22 +458,49 @@ app.get("/api/issues/lookup", wrap(async (req, res) => {
     ruleId: r.rule_id, evidence: r.evidence ?? r.message,
   })]);
   const found = await db.findIssuesByMarkers(target.owner, target.repo, markers.map(([, m]) => m));
+  await refreshStaleStates(target, [...found.values()], auth.tokenFor(req));
   const out = {};
   for (const [id, m] of markers) {
     const hit = found.get(m);
-    if (hit) out[id] = { number: hit.number, htmlUrl: hit.html_url };
+    // 閉じているものは「再発として立てられる」ことが分かるよう state も返す
+    if (hit) out[id] = { number: hit.number, htmlUrl: hit.html_url, state: hit.state };
   }
   res.json({ findings: out, annotations: {} });
 }));
 
-/** 注釈1件ぶんの重複防止の鍵。起票側と一覧側で同じものを使う。 */
+/**
+ * 注釈1件ぶんの重複防止の鍵。起票側と一覧側で同じものを使う。
+ *
+ * 行番号は入れない。文書を編集して行がずれても同じ問題を指すため。
+ * 指摘 (findings) 側も内容だけで見ているので、揃えてある。
+ */
 function annotationMarker(target, a) {
   const srcPath = a.source_ref?.path ?? a.document_title ?? "文書";
   return gh.issueMarker({
     owner: target.owner, repo: target.repo, path: srcPath,
     ruleId: `human/${a.aspect_id ?? "unclassified"}`,
-    evidence: `${a.start_line}:${a.quoted_text}`,
+    evidence: a.quoted_text,
   });
+}
+
+/**
+ * 起票済みかを判断する。閉じている issue は「直したが再発した」と扱い、
+ * 新しく立てられるようにする。
+ *
+ * 返り値: {issue, open} — open が false なら起票してよい。
+ */
+async function issueStateFor(target, marker, token) {
+  const existing = await db.findIssue(target.owner, target.repo, marker);
+  if (!existing) return { issue: null, open: false };
+  try {
+    const live = await gh.getIssue(target.owner, target.repo, existing.number, { token });
+    await db.updateIssueState(existing.id, live.state);
+    return { issue: { ...existing, state: live.state }, open: live.state === "open" };
+  } catch {
+    // GitHub に届かないときは、記録している状態で判断する。
+    // 消えた issue で永久に起票できなくなるより、控えめに止める方を選ぶ。
+    return { issue: existing, open: existing.state === "open" };
+  }
 }
 
 /**
@@ -480,8 +532,8 @@ app.post("/api/annotations/issues", wrap(async (req, res) => {
     evidence: rows.map((r) => `${r.start_line}:${r.quoted_text}`).join("\n"),
   });
 
-  const existing = await db.findIssue(target.owner, target.repo, marker);
-  if (existing) return res.json({ issue: existing, deduped: true });
+  const { issue: prev, open } = await issueStateFor(target, marker, token);
+  if (open) return res.json({ issue: prev, deduped: true });
 
   const headline = (t) => {
     const h = String(t ?? "").split(/[。\n]/)[0].trim();
@@ -494,6 +546,7 @@ app.post("/api/annotations/issues", wrap(async (req, res) => {
   const lines = [
     `\`${srcPath}\` を読んで見つけた指摘。**システムは検出していない。**`, "",
   ];
+  if (prev) lines.push(`以前 #${prev.number} として起票され、閉じられている。再発として立てた。`, "");
   for (const r of rows) {
     lines.push(`### L${r.start_line}${r.end_line !== r.start_line ? `-${r.end_line}` : ""}`
       + (r.aspect_id ? ` ${r.aspect_id} ${r.aspect_title ?? ""}` : " (観点未分類)"), "");

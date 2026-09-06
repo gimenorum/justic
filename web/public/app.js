@@ -97,14 +97,23 @@ function findingCard(f, review) {
 
   if (f.verdict === "accepted" && state.health.github?.token) {
     const known = state.issuedFindings?.[f.id];
-    if (known) {
+    if (known && known.state !== "closed") {
       // 押す前に分かるようにする。押してから「もうある」と言われない
       const link = document.createElement("a");
       link.href = known.htmlUrl; link.target = "_blank"; link.className = "issue-link";
       link.textContent = `起票済み #${known.number}`;
       row.appendChild(link);
     } else {
-      const issue = Object.assign(document.createElement("button"), { textContent: "issue にする", className: "ghost" });
+      if (known) {
+        // 閉じている = 一度直された。再発として立て直せる
+        const link = document.createElement("a");
+        link.href = known.htmlUrl; link.target = "_blank"; link.className = "issue-link";
+        link.textContent = `#${known.number} は解決済み`;
+        row.appendChild(link);
+      }
+      const issue = Object.assign(document.createElement("button"), {
+        textContent: known ? "再発として起票" : "issue にする", className: "ghost",
+      });
       issue.onclick = () => createIssue([f.id], issue, review);
       row.appendChild(issue);
     }
@@ -271,11 +280,13 @@ async function annotationPanel(reviewId) {
       if (a.issue_url) {
         const link = document.createElement("a");
         link.href = a.issue_url; link.target = "_blank"; link.className = "issue-link";
-        link.textContent = `#${a.issue_number}`;
+        link.textContent = a.issue_state === "closed" ? `#${a.issue_number} 解決済み` : `#${a.issue_number}`;
         item.appendChild(link);
-      } else if (!a.retracted && state.health.github?.token) {
+      }
+      if ((!a.issue_url || a.issue_state === "closed") && !a.retracted && state.health.github?.token) {
         const mk = Object.assign(document.createElement("button"), {
-          textContent: "issue にする", className: "ghost small",
+          textContent: a.issue_state === "closed" ? "再発として起票" : "issue にする",
+          className: "ghost small",
         });
         mk.onclick = async () => {
           const repo = ($("issueRepo").value || state.issueRepo || "").trim();
