@@ -83,6 +83,7 @@ function findingCard(f, review) {
       });
       f.verdict = verdict;
       f.corrected_text = verdict === "accepted" ? fix.value : null;
+      await refreshIssued();
       render();
       refreshStats();
     } catch (e) {
@@ -95,9 +96,18 @@ function findingCard(f, review) {
   row.append(fix, accept, reject);
 
   if (f.verdict === "accepted" && state.health.github?.token) {
-    const issue = Object.assign(document.createElement("button"), { textContent: "issue にする", className: "ghost" });
-    issue.onclick = () => createIssue([f.id], issue, review);
-    row.appendChild(issue);
+    const known = state.issuedFindings?.[f.id];
+    if (known) {
+      // 押す前に分かるようにする。押してから「もうある」と言われない
+      const link = document.createElement("a");
+      link.href = known.htmlUrl; link.target = "_blank"; link.className = "issue-link";
+      link.textContent = `起票済み #${known.number}`;
+      row.appendChild(link);
+    } else {
+      const issue = Object.assign(document.createElement("button"), { textContent: "issue にする", className: "ghost" });
+      issue.onclick = () => createIssue([f.id], issue, review);
+      row.appendChild(issue);
+    }
   }
   el.appendChild(row);
   return el;
@@ -115,7 +125,7 @@ async function annotationPanel(reviewId) {
 
   const full = await api(`/api/reviews/${reviewId}`);
   const docId = full.document_id;
-  let data = await api(`/api/documents/${docId}/annotations`);
+  let data = await api(`/api/documents/${docId}/annotations${issueRepoQuery()}`);
   const aspectId = state.health.aspects?.[0]?.id ?? "D-01";
   const lines = String(full.body ?? "").split("\n");
   const findingLines = new Set(full.findings.map((f) => f.line).filter(Boolean));
@@ -163,7 +173,7 @@ async function annotationPanel(reviewId) {
       });
       sel = null;
       note.value = "";
-      data = await api(`/api/documents/${docId}/annotations`);
+      data = await api(`/api/documents/${docId}/annotations${issueRepoQuery()}`);
       paintSelection(); paintMarks(); renderList(); renderHead(); refreshStats();
     } catch (e) { alert(needLogin(e)); }
     add.disabled = false;
@@ -236,7 +246,7 @@ async function annotationPanel(reviewId) {
             body: JSON.stringify({ aspectId }),
           });
         }
-        data = await api(`/api/documents/${docId}/annotations`);
+        data = await api(`/api/documents/${docId}/annotations${issueRepoQuery()}`);
         renderHead(); refreshStats();
       } catch (e) { alert(needLogin(e)); }
     };
@@ -257,6 +267,36 @@ async function annotationPanel(reviewId) {
       item.querySelector(".q").onclick = () => {
         lineEls[a.start_line - 1]?.scrollIntoView({ block: "center", behavior: "smooth" });
       };
+      // 起票は押したときだけ。登録と同時には立てない。
+      if (a.issue_url) {
+        const link = document.createElement("a");
+        link.href = a.issue_url; link.target = "_blank"; link.className = "issue-link";
+        link.textContent = `#${a.issue_number}`;
+        item.appendChild(link);
+      } else if (!a.retracted && state.health.github?.token) {
+        const mk = Object.assign(document.createElement("button"), {
+          textContent: "issue にする", className: "ghost small",
+        });
+        mk.onclick = async () => {
+          const repo = ($("issueRepo").value || state.issueRepo || "").trim();
+          if (!repo) { alert("起票先の owner/repo を入れる"); $("issueRepo").focus(); return; }
+          mk.disabled = true; mk.textContent = "起票中…";
+          try {
+            const r = await api("/api/annotations/issues", {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({ repo, annotationIds: [a.id] }),
+            });
+            if (r.deduped) alert("同じ指摘の issue が既にある。新しくは立てなかった。");
+            data = await api(`/api/documents/${docId}/annotations${issueRepoQuery()}`);
+            renderList();
+          } catch (e) {
+            alert(`起票できなかった: ${e.message}`);
+            mk.disabled = false; mk.textContent = "issue にする";
+          }
+        };
+        item.appendChild(mk);
+      }
+
       const undo = Object.assign(document.createElement("button"), {
         textContent: a.retracted ? "戻す" : "取消", className: "ghost small",
       });
@@ -264,7 +304,7 @@ async function annotationPanel(reviewId) {
         try {
           await api(`/api/annotations/${a.id}/${a.retracted ? "restore" : "retract"}`,
             { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-          data = await api(`/api/documents/${docId}/annotations`);
+          data = await api(`/api/documents/${docId}/annotations${issueRepoQuery()}`);
           paintMarks(); renderList(); refreshStats();
         } catch (e) { alert(needLogin(e)); }
       };
@@ -281,6 +321,12 @@ async function annotationPanel(reviewId) {
   }
   renderHead(); paintMarks(); renderList(); paintSelection();
   return panel;
+}
+
+// 起票先。押す前に重複を解決するため、一覧の取得時にも渡す。
+function issueRepoQuery() {
+  const repo = ($("issueRepo")?.value || state.issueRepo || "").trim();
+  return repo ? `?repo=${encodeURIComponent(repo)}` : "";
 }
 
 const needLogin = (e) =>
@@ -338,6 +384,17 @@ function reviewBlock(r) {
     for (const f of r.findings) wrap.appendChild(findingCard(f, r));
   }
   return wrap;
+}
+
+/** 採用済みの指摘について、起票済みかを引いて表示に反映する。 */
+async function refreshIssued() {
+  const repo = ($("issueRepo")?.value || state.issueRepo || "").trim();
+  const ids = allFindings().filter((f) => f.verdict === "accepted").map((f) => f.id);
+  if (!repo || ids.length === 0) { state.issuedFindings = {}; return; }
+  try {
+    const r = await api(`/api/issues/lookup?repo=${encodeURIComponent(repo)}&findings=${ids.join(",")}`);
+    state.issuedFindings = r.findings ?? {};
+  } catch { state.issuedFindings = {}; }
 }
 
 function render() {
@@ -429,6 +486,7 @@ $("run").onclick = async () => {
     $("notice").hidden = notes.length === 0;
     $("notice").textContent = notes.join("  ");
 
+    await refreshIssued();
     $("runState").textContent = r.kind === "branch"
       ? `${r.repo.branch} を走査。${r.scanned}/${r.total} ファイル`
       : r.kind === "pr" ? `PR #${r.pr.number} ${reviews.length}ファイル` : `検査した層: ${reviews[0]?.layers?.join(" + ") ?? ""}`;

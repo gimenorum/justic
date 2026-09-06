@@ -351,10 +351,19 @@ app.get("/api/golden-set", wrap(async (req, res) => {
 
 app.get("/api/documents/:id/annotations", wrap(async (req, res) => {
   const documentId = Number(req.params.id);
-  res.json({
-    annotations: await db.listAnnotations(documentId),
-    completions: await db.listCompletions(documentId),
-  });
+  const annotations = await db.listAnnotations(documentId);
+  // 重複の鍵はサーバー側の値から作るので、クライアントには計算できない。
+  // 押してから「もうある」と言われないよう、一覧の時点で解決しておく。
+  const target = gh.parseRepoRef(req.query.repo);
+  if (target && annotations.length) {
+    const markers = annotations.map((a) => annotationMarker(target, a));
+    const found = await db.findIssuesByMarkers(target.owner, target.repo, markers);
+    annotations.forEach((a, i) => {
+      const hit = found.get(markers[i]);
+      if (hit && !a.issue_url) { a.issue_url = hit.html_url; a.issue_number = hit.number; }
+    });
+  }
+  res.json({ annotations, completions: await db.listCompletions(documentId) });
 }));
 
 app.post("/api/documents/:id/annotations", wrap(async (req, res) => {
@@ -405,6 +414,104 @@ app.post("/api/documents/:id/completions", wrap(async (req, res) => {
   const aspectId = String(req.body?.aspectId ?? "");
   if (!aspectId) return res.status(400).json({ error: "aspectId が要る" });
   res.json(await db.addCompletion(Number(req.params.id), aspectId, s.userId));
+}));
+
+/**
+ * 起票済みかをまとめて引く。押してから「もうある」と言われないようにする。
+ * 鍵はサーバー側の値から作るので、クライアントには計算できない。
+ */
+app.get("/api/issues/lookup", wrap(async (req, res) => {
+  const target = gh.parseRepoRef(req.query.repo);
+  if (!target) return res.json({ findings: {}, annotations: {} });
+  const ids = String(req.query.findings ?? "").split(",").map(Number).filter(Number.isFinite);
+  if (ids.length === 0) return res.json({ findings: {}, annotations: {} });
+
+  const rows = await db.acceptedFindings(ids);
+  const markers = rows.map((r) => [r.id, gh.issueMarker({
+    owner: target.owner, repo: target.repo,
+    path: r.source_ref?.path ?? r.document_title ?? "文書",
+    ruleId: r.rule_id, evidence: r.evidence ?? r.message,
+  })]);
+  const found = await db.findIssuesByMarkers(target.owner, target.repo, markers.map(([, m]) => m));
+  const out = {};
+  for (const [id, m] of markers) {
+    const hit = found.get(m);
+    if (hit) out[id] = { number: hit.number, htmlUrl: hit.html_url };
+  }
+  res.json({ findings: out, annotations: {} });
+}));
+
+/** 注釈1件ぶんの重複防止の鍵。起票側と一覧側で同じものを使う。 */
+function annotationMarker(target, a) {
+  const srcPath = a.source_ref?.path ?? a.document_title ?? "文書";
+  return gh.issueMarker({
+    owner: target.owner, repo: target.repo, path: srcPath,
+    ruleId: `human/${a.aspect_id ?? "unclassified"}`,
+    evidence: `${a.start_line}:${a.quoted_text}`,
+  });
+}
+
+/**
+ * 人手注釈から issue を立てる。
+ *
+ * findings 用の /api/issues とは経路を分ける。注釈は採否を持たず、
+ * id の空間も違う (github_issues.finding_ids と annotation_ids)。
+ * 押したときだけ立てる。登録と同時には立てない。
+ */
+app.post("/api/annotations/issues", wrap(async (req, res) => {
+  const s = requireSession(req, res);
+  if (!s) return;
+  const token = auth.tokenFor(req);
+  if (!gh.hasToken(token)) return res.status(401).json({ error: "起票には GitHub のトークンが要る" });
+
+  const target = gh.parseRepoRef(req.body?.repo);
+  if (!target) return res.status(400).json({ error: "repo は owner/repo で渡す" });
+  const ids = (req.body?.annotationIds ?? []).map(Number).filter(Number.isFinite);
+  if (ids.length === 0) return res.status(400).json({ error: "annotationIds が空" });
+
+  const rows = await db.annotationsForIssue(ids);
+  if (rows.length === 0) return res.status(400).json({ error: "対象の注釈がない (取り消し済みか)" });
+
+  const first = rows[0];
+  const srcPath = first.source_ref?.path ?? first.document_title ?? "文書";
+  const marker = rows.length === 1 ? annotationMarker(target, first) : gh.issueMarker({
+    owner: target.owner, repo: target.repo, path: srcPath,
+    ruleId: "human/batch",
+    evidence: rows.map((r) => `${r.start_line}:${r.quoted_text}`).join("\n"),
+  });
+
+  const existing = await db.findIssue(target.owner, target.repo, marker);
+  if (existing) return res.json({ issue: existing, deduped: true });
+
+  const headline = (t) => {
+    const h = String(t ?? "").split(/[。\n]/)[0].trim();
+    return h.length > 46 ? `${h.slice(0, 46)}…` : h;
+  };
+  const title = rows.length === 1
+    ? `[人手] ${srcPath} L${first.start_line}: ${headline(first.note || first.quoted_text)}`
+    : `[人手] ${srcPath}: ${rows.length}件の指摘`;
+
+  const lines = [
+    `\`${srcPath}\` を読んで見つけた指摘。**システムは検出していない。**`, "",
+  ];
+  for (const r of rows) {
+    lines.push(`### L${r.start_line}${r.end_line !== r.start_line ? `-${r.end_line}` : ""}`
+      + (r.aspect_id ? ` ${r.aspect_id} ${r.aspect_title ?? ""}` : " (観点未分類)"), "");
+    lines.push("> " + r.quoted_text.replace(/\n/g, "\n> "), "");
+    if (r.note) lines.push(r.note, "");
+    lines.push(`— @${r.author}`, "");
+  }
+  if (first.source_ref?.html_url) lines.push(`出典: ${first.source_ref.html_url}`, "");
+  lines.push(`<!-- ${gh.MARKER_PREFIX}${marker} -->`);
+
+  const created = await gh.createIssue(target.owner, target.repo, {
+    title, body: lines.join("\n"), labels: req.body?.labels ?? [], token,
+  });
+  const saved = await db.recordIssue(target.owner, target.repo, {
+    ...created, marker, findingIds: [], annotationIds: rows.map((r) => Number(r.id)),
+    userId: s.userId,
+  });
+  res.json({ issue: saved, deduped: false, from: rows.length });
 }));
 
 app.delete("/api/documents/:id/completions/:aspectId", wrap(async (req, res) => {

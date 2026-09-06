@@ -203,6 +203,16 @@ export async function acceptedFindings(findingIds) {
   return rows;
 }
 
+/** 鍵をまとめて引く。押す前に「もう立っている」を出すために要る。 */
+export async function findIssuesByMarkers(owner, repo, markers) {
+  if (!markers.length) return new Map();
+  const { rows } = await pool.query(
+    `select marker, number, html_url from github_issues
+     where owner = $1 and repo = $2 and marker = any($3::text[])`,
+    [owner, repo, markers]);
+  return new Map(rows.map((r) => [r.marker, r]));
+}
+
 export async function findIssue(owner, repo, marker) {
   const { rows } = await pool.query(
     `select * from github_issues where owner = $1 and repo = $2 and marker = $3`,
@@ -211,13 +221,14 @@ export async function findIssue(owner, repo, marker) {
   return rows[0] ?? null;
 }
 
-export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds, userId }) {
+export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds, annotationIds, userId }) {
   const { rows } = await pool.query(
-    `insert into github_issues (owner, repo, number, html_url, title, marker, finding_ids, user_id)
-     values ($1,$2,$3,$4,$5,$6,$7,$8)
+    `insert into github_issues
+       (owner, repo, number, html_url, title, marker, finding_ids, annotation_ids, user_id)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
      on conflict (owner, repo, marker) do nothing
      returning *`,
-    [owner, repo, number, htmlUrl, title, marker, findingIds, userId ?? null],
+    [owner, repo, number, htmlUrl, title, marker, findingIds ?? [], annotationIds ?? [], userId ?? null],
   );
   return rows[0] ?? (await findIssue(owner, repo, marker));
 }
@@ -285,13 +296,51 @@ export async function listAnnotations(documentId) {
   const { rows } = await pool.query(
     `select a.id, a.document_id, a.start_line, a.end_line, a.quoted_text,
             a.aspect_id, a.note, a.created_at, u.login as author,
-            (l.id is null) as retracted
+            (l.id is null) as retracted,
+            i.html_url as issue_url, i.number as issue_number,
+            d.title as document_title,
+            -- 鍵の計算に要る。同じ文書の最後に走ったレビューの出どころ
+            (select r.source_ref from reviews r
+              where r.document_id = a.document_id and r.source_ref is not null
+              order by r.started_at desc limit 1) as source_ref
      from human_annotations a
      join users u on u.id = a.user_id
+     join documents d on d.id = a.document_id
      left join live_annotations l on l.id = a.id
+     left join lateral (
+       select gi.html_url, gi.number from github_issues gi
+       where a.id = any(gi.annotation_ids) order by gi.created_at desc limit 1
+     ) i on true
      where a.document_id = $1
      order by a.start_line, a.id`,
     [documentId]);
+  return rows;
+}
+
+/**
+ * 起票の対象になる注釈。取り消されたものは返さない。
+ *
+ * findings 用の acceptedFindings は verdicts を内部結合しているので使えない。
+ * 注釈は採否を持たない (システムが出していないため)。
+ */
+export async function annotationsForIssue(annotationIds) {
+  const { rows } = await pool.query(
+    `select a.id, a.document_id, a.start_line, a.end_line, a.quoted_text,
+            a.aspect_id, a.note, u.login as author,
+            asp.title as aspect_title,
+            d.title as document_title,
+            -- 出どころ。同じ文書に複数のレビューがあるので、最後に走ったものを見る
+            (select r.source_ref from reviews r
+              where r.document_id = a.document_id and r.source_ref is not null
+              order by r.started_at desc limit 1) as source_ref
+     from live_annotations a
+     join users u      on u.id = a.user_id
+     join documents d  on d.id = a.document_id
+     left join aspects asp on asp.id = a.aspect_id
+     where a.id = any($1::bigint[])
+     order by a.document_id, a.start_line, a.id`,
+    [annotationIds],
+  );
   return rows;
 }
 
