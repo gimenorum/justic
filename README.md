@@ -57,7 +57,8 @@ L3 (設計内容) は差分では判定できない。「異常系が書かれ�
 ブラウザに持たせる。DB の控えが漏れても資格情報は出ない。鍵は `JUSTIC_SESSION_SECRET`。
 
 OAuth App は GitHub の Settings > Developer settings で作る。
-callback は `http://127.0.0.1:5180/auth/callback`。
+コールバックの欄は **「Redirect URIs」** (旧「Authorization callback URL」)。
+`http://127.0.0.1:5180/auth/callback` を入れ、「Allow wildcard matching」は外したままにする。
 
 ## 構成
 
