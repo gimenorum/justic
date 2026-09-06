@@ -267,8 +267,15 @@ app.post("/api/issues", wrap(async (req, res) => {
   const existing = await db.findIssue(target.owner, target.repo, marker);
   if (existing) return res.json({ issue: existing, deduped: true });
 
+  // 指摘文をそのまま入れると一覧で読めない。最初の一文だけを切り出し、
+  // 場所とルール名を添える。詳細は本文にある。
+  const shortRule = (id) => String(id).split("/").pop();
+  const headline = (msg) => {
+    const first = String(msg).split(/[。\n]/)[0].trim();
+    return first.length > 46 ? `${first.slice(0, 46)}…` : first;
+  };
   const title = rows.length === 1
-    ? `[${first.layer}] ${srcPath}: ${first.message.split("\n")[0].slice(0, 80)}`
+    ? `[${first.layer}] ${srcPath}${first.line ? ` L${first.line}` : ""}: ${headline(first.message)} (${shortRule(first.rule_id)})`
     : `[レビュー] ${srcPath}: ${rows.length}件の指摘`;
 
   const lines = [`\`${srcPath}\` のレビューで採用された指摘。`, ""];
