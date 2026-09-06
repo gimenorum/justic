@@ -97,20 +97,16 @@ function findingCard(f, review) {
 
   if (f.verdict === "accepted" && state.health.github?.token) {
     const known = state.issuedFindings?.[f.id];
-    if (known && known.state !== "closed") {
-      // 押す前に分かるようにする。押してから「もうある」と言われない
+    if (known) {
       const link = document.createElement("a");
       link.href = known.htmlUrl; link.target = "_blank"; link.className = "issue-link";
-      link.textContent = `起票済み #${known.number}`;
+      link.textContent = known.blocks
+        ? (known.state === "open" ? `起票済み #${known.number}` : `#${known.number} 対応しない`)
+        : `#${known.number} 解決済み`;
       row.appendChild(link);
-    } else {
-      if (known) {
-        // 閉じている = 一度直された。再発として立て直せる
-        const link = document.createElement("a");
-        link.href = known.htmlUrl; link.target = "_blank"; link.className = "issue-link";
-        link.textContent = `#${known.number} は解決済み`;
-        row.appendChild(link);
-      }
+    }
+    // blocks が立っていれば押せない。open だけでなく not_planned も止める
+    if (!known?.blocks) {
       const issue = Object.assign(document.createElement("button"), {
         textContent: known ? "再発として起票" : "issue にする", className: "ghost",
       });
@@ -280,12 +276,14 @@ async function annotationPanel(reviewId) {
       if (a.issue_url) {
         const link = document.createElement("a");
         link.href = a.issue_url; link.target = "_blank"; link.className = "issue-link";
-        link.textContent = a.issue_state === "closed" ? `#${a.issue_number} 解決済み` : `#${a.issue_number}`;
+        link.textContent = a.issue_blocks
+          ? (a.issue_state === "open" ? `#${a.issue_number}` : `#${a.issue_number} 対応しない`)
+          : `#${a.issue_number} 解決済み`;
         item.appendChild(link);
       }
-      if ((!a.issue_url || a.issue_state === "closed") && !a.retracted && state.health.github?.token) {
+      if (!a.issue_blocks && !a.retracted && state.health.github?.token) {
         const mk = Object.assign(document.createElement("button"), {
-          textContent: a.issue_state === "closed" ? "再発として起票" : "issue にする",
+          textContent: a.issue_url ? "再発として起票" : "issue にする",
           className: "ghost small",
         });
         mk.onclick = async () => {
@@ -431,9 +429,14 @@ async function createIssue(findingIds, button, review) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ repo, findingIds }),
     });
-    review.issueUrl = r.issue.html_url;
+    review.issueUrl = r.issue?.html_url;
+    await refreshIssued();
     render();
-    if (r.deduped) alert("同じ指摘の issue が既にある。新しくは立てなかった。");
+    if (r.deduped) {
+      alert(r.issue
+        ? `既に #${r.issue.number} がある。新しくは立てなかった。`
+        : "対象がなかった。");
+    }
   } catch (e) {
     alert(`起票できなかった: ${e.message}`);
     button.disabled = false;
@@ -453,6 +456,13 @@ for (const tab of document.querySelectorAll(".tab")) {
 }
 
 $("sample").onclick = () => { $("title").value = "決済API 設計書"; $("body").value = SAMPLE; };
+
+// 起票先を後から入れる順序でも「押す前に分かる」を成立させる
+$("issueRepo").onchange = async () => {
+  state.issueRepo = $("issueRepo").value.trim();
+  await refreshIssued();
+  render();
+};
 
 const ENDPOINTS = {
   paste: () => ({ url: "/api/reviews", body: { title: $("title").value, body: $("body").value.trim() } }),

@@ -190,7 +190,7 @@ export async function stats() {
 /** 起票の対象。採用されたものだけを返す。未判断や却下は起票しない。 */
 export async function acceptedFindings(findingIds) {
   const { rows } = await pool.query(
-    `select f.id, f.rule_id, f.layer, f.severity, f.line, f.message, f.evidence, f.in_diff,
+    `select f.id, f.rule_id, f.layer, f.severity, f.line, f.col, f.message, f.evidence, f.in_diff,
             v.corrected_text, r.source_kind, r.source_ref, d.title as document_title
      from findings f
      join current_verdicts v on v.finding_id = f.id and v.verdict = 'accepted'
@@ -203,43 +203,60 @@ export async function acceptedFindings(findingIds) {
   return rows;
 }
 
+const ISSUE_COLS = `id, number, html_url, state, state_reason,
+                    state_checked_at, state_error_at, marker, finding_ids, annotation_ids`;
+
 /**
- * 鍵ごとに最後に立てた issue を引く。押す前に「もう立っている」を出すために要る。
+ * id で引く。**これが同一性の主たる判定。**
  *
- * marker は「どの問題か」を指すもので、issue そのものではない。
- * 同じ問題が再発すれば issue は複数あるので、最新を見る。
+ * 内容のハッシュ (marker) だけでは、同じ行に出た別の指摘を潰してしまう
+ * (evidence が行全文なので、col しか違わない2件が同じ鍵になる)。
+ * どの指摘・注釈がどの issue に載ったかは記録してあるので、そちらを正とする。
  */
-export async function findIssuesByMarkers(owner, repo, markers) {
-  if (!markers.length) return new Map();
+export async function issuesForRefs(owner, repo, { findingIds = [], annotationIds = [] }) {
+  if (!findingIds.length && !annotationIds.length) return [];
   const { rows } = await pool.query(
-    `select distinct on (marker) marker, id, number, html_url, state, state_checked_at
-     from github_issues
+    `select ${ISSUE_COLS} from github_issues
+     where owner = $1 and repo = $2
+       and (finding_ids && $3::bigint[] or annotation_ids && $4::bigint[])
+     order by created_at desc, id desc`,
+    [owner, repo, findingIds, annotationIds]);
+  return rows;
+}
+
+/**
+ * 鍵で引く。**補助。** 再走査で id が変わった同じ指摘を拾うためだけに使う。
+ * 「どれか open なものがあるか」を判断するので、最新1件ではなく全件を返す。
+ */
+export async function issuesByMarkers(owner, repo, markers) {
+  if (!markers.length) return [];
+  const { rows } = await pool.query(
+    `select ${ISSUE_COLS} from github_issues
      where owner = $1 and repo = $2 and marker = any($3::text[])
-     order by marker, created_at desc, id desc`,
+     order by created_at desc, id desc`,
     [owner, repo, markers]);
-  return new Map(rows.map((r) => [r.marker, r]));
+  return rows;
 }
 
-export async function findIssue(owner, repo, marker) {
-  const { rows } = await pool.query(
-    `select * from github_issues where owner = $1 and repo = $2 and marker = $3
-     order by created_at desc, id desc limit 1`,
-    [owner, repo, marker],
-  );
-  return rows[0] ?? null;
-}
-
-export async function updateIssueState(id, state) {
+export async function updateIssueState(id, { state, stateReason }) {
   await pool.query(
-    `update github_issues set state = $2, state_checked_at = now() where id = $1`,
-    [id, state]);
+    `update github_issues
+        set state = $2, state_reason = $3, state_checked_at = now(), state_error_at = null
+      where id = $1`,
+    [id, state, stateReason ?? null]);
+}
+
+/** 取れなかったことも残す。残さないと届かない issue を毎回叩き続ける。 */
+export async function markIssueUnreachable(id) {
+  await pool.query(`update github_issues set state_error_at = now() where id = $1`, [id]);
 }
 
 export async function recordIssue(owner, repo, { number, htmlUrl, title, marker, findingIds, annotationIds, userId }) {
   const { rows } = await pool.query(
     `insert into github_issues
-       (owner, repo, number, html_url, title, marker, finding_ids, annotation_ids, user_id)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       (owner, repo, number, html_url, title, marker, finding_ids, annotation_ids, user_id,
+        state, state_checked_at)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'open',now())
      returning *`,
     [owner, repo, number, htmlUrl, title, marker, findingIds ?? [], annotationIds ?? [], userId ?? null],
   );

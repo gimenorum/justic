@@ -295,19 +295,25 @@ app.post("/api/issues", wrap(async (req, res) => {
   const ids = (req.body?.findingIds ?? []).map(Number).filter(Number.isFinite);
   if (ids.length === 0) return res.status(400).json({ error: "findingIds が空" });
 
-  const rows = await db.acceptedFindings(ids);
+  let rows = await db.acceptedFindings(ids);
   if (rows.length === 0) return res.status(400).json({ error: "採用された指摘がない。先に採用を押す" });
+
+  // 既に「止める」issue に載っている要素を外す。id で引くので、
+  // バッチで立てたものを単件で立て直す事故が起きない。
+  // 全部載っていれば立てない。一部だけなら残りで立てる。
+  const resolved = await resolveIssued(target, { findings: rows }, token);
+  const prev = resolved.findings[rows[0].id] ?? null;
+  const fresh = rows.filter((r) => !blocksNewIssue(resolved.findings[r.id]));
+  if (fresh.length === 0) return res.json({ issue: prev, deduped: true, blocked: rows.length });
+  rows = fresh;
 
   const first = rows[0];
   const srcPath = first.source_ref?.path ?? first.document_title ?? "文書";
-  const marker = gh.issueMarker({
+  const marker = rows.length === 1 ? findingMarker(target, first) : gh.issueMarker({
     owner: target.owner, repo: target.repo, path: srcPath,
-    ruleId: rows.length === 1 ? first.rule_id : "batch",
-    evidence: rows.map((r) => r.evidence ?? r.message).join("\n"),
+    ruleId: "batch",
+    evidence: rows.map((r) => r.evidence ?? r.message),   // 配列で渡す。区切りは NUL
   });
-
-  const { issue: prev, open } = await issueStateFor(target, marker, token);
-  if (open) return res.json({ issue: prev, deduped: true });
 
   // 指摘文をそのまま入れると一覧で読めない。最初の一文だけを切り出し、
   // 場所とルール名を添える。詳細は本文にある。
@@ -356,18 +362,20 @@ app.get("/api/documents/:id/annotations", wrap(async (req, res) => {
   // 重複の鍵はサーバー側の値から作るので、クライアントには計算できない。
   // 押してから「もうある」と言われないよう、一覧の時点で解決しておく。
   const target = gh.parseRepoRef(req.query.repo);
+  // GitHub に問い合わせるのはセッションのある人だけ。認証不要の GET で
+  // .env の PAT を消費させられると、外部ページからレート制限を枯らせる。
+  const token = auth.sessionOf(req)?.token ?? null;
   if (target && annotations.length) {
-    const markers = annotations.map((a) => annotationMarker(target, a));
-    const found = await db.findIssuesByMarkers(target.owner, target.repo, markers);
-    await refreshStaleStates(target, [...found.values()], auth.tokenFor(req));
-    annotations.forEach((a, i) => {
-      const hit = found.get(markers[i]);
-      if (!hit) return;
+    const r = await resolveIssued(target, { annotations }, token);
+    for (const a of annotations) {
+      const hit = r.annotations[a.id];
+      if (!hit) continue;
       a.issue_url = hit.html_url;
       a.issue_number = hit.number;
-      // 閉じているなら再発として立て直せる
       a.issue_state = hit.state;
-    });
+      a.issue_state_reason = hit.state_reason;
+      a.issue_blocks = blocksNewIssue(hit);
+    }
   }
   res.json({ annotations, completions: await db.listCompletions(documentId) });
 }));
@@ -423,22 +431,94 @@ app.post("/api/documents/:id/completions", wrap(async (req, res) => {
 }));
 
 const STATE_TTL_MS = 10 * 60 * 1000;
+const STATE_ERROR_BACKOFF_MS = 30 * 60 * 1000;
+const STATE_REFRESH_MAX = 10;
+
+/**
+ * その issue が新規の起票を止めるか。
+ *
+ *   open                       止める。まだ直っていない
+ *   closed / not_planned       止める。**直さないと決めた指摘を蒸し返さない**
+ *   closed / duplicate         止める
+ *   closed / completed か不明   止めない。直ったので、再発なら立ててよい
+ */
+function blocksNewIssue(i) {
+  if (!i) return false;
+  if (i.state === "open") return true;
+  return i.state_reason === "not_planned" || i.state_reason === "duplicate";
+}
 
 /**
  * 記録している状態が古いものだけ GitHub に引き直す。
  * 一覧を開くたびに全件叩くとレート制限をすぐ使い切る。
  */
 async function refreshStaleStates(target, issues, token) {
-  const stale = issues.filter((i) =>
-    !i.state_checked_at || Date.now() - new Date(i.state_checked_at).getTime() > STATE_TTL_MS);
-  for (const i of stale.slice(0, 10)) {
+  const now = Date.now();
+  const stale = issues.filter((i) => {
+    // 取れなかったものは間を置く。届かない issue を毎回叩かない
+    if (i.state_error_at && now - new Date(i.state_error_at).getTime() < STATE_ERROR_BACKOFF_MS) return false;
+    return !i.state_checked_at || now - new Date(i.state_checked_at).getTime() > STATE_TTL_MS;
+  }).slice(0, STATE_REFRESH_MAX);
+
+  // 直列に await すると、GitHub が詰まったとき GET が最大 (件数 × タイムアウト) 秒返らない
+  await Promise.all(stale.map(async (i) => {
     try {
       const live = await gh.getIssue(target.owner, target.repo, i.number, { token });
-      // 変わっていなくても確認した時刻は残す。残さないと TTL が効かず毎回叩く
-      await db.updateIssueState(i.id, live.state);
+      await db.updateIssueState(i.id, live);
       i.state = live.state;
-    } catch { /* 届かなければ記録している状態のまま */ }
-  }
+      i.state_reason = live.stateReason;
+    } catch (e) {
+      if (e.status === 404) {
+        // 消えている。止める理由が無いので、起票できる状態にする
+        await db.updateIssueState(i.id, { state: "closed", stateReason: "deleted" });
+        i.state = "closed"; i.state_reason = "deleted";
+      } else {
+        // 届かない。記録している状態のまま止めるが、時刻は残して叩き続けない
+        await db.markIssueUnreachable(i.id);
+      }
+    }
+  }));
+}
+
+/**
+ * 起票済みかを解決する。
+ *
+ * 主: **id で引く** (github_issues.finding_ids / annotation_ids)。
+ * 従: marker で引く。再走査で id が変わった同じ指摘を拾うためだけ。
+ *
+ * marker だけに頼ると、同じ行に出た別の指摘 (col しか違わない) が潰れ、
+ * バッチ起票と単件起票で鍵が食い違って二重に立つ。
+ */
+async function resolveIssued(target, { findings = [], annotations = [] }, token) {
+  const findingIds = findings.map((f) => Number(f.id));
+  const annotationIds = annotations.map((a) => Number(a.id));
+
+  const byRef = await db.issuesForRefs(target.owner, target.repo, { findingIds, annotationIds });
+
+  // marker の照合は**指摘だけ**に使う。再走査すると findings は新しい id で
+  // 作り直されるので、id だけでは前回の起票を辿れない。
+  // 注釈は行が作り直されず id が安定しているので、marker で引く必要が無い。
+  // 引くと、同じ文言を2箇所に付けた注釈が誤って同一視される。
+  const markerOf = new Map();
+  for (const f of findings) markerOf.set(`f${f.id}`, findingMarker(target, f));
+  const byMarker = await db.issuesByMarkers(target.owner, target.repo, [...new Set(markerOf.values())]);
+
+  await refreshStaleStates(target, [...byRef, ...byMarker], token);
+
+  const pick = (key, id, kind) => {
+    const marker = markerOf.get(key);
+    const candidates = [
+      ...byRef.filter((i) => (kind === "f" ? i.finding_ids : i.annotation_ids).map(Number).includes(id)),
+      ...(marker ? byMarker.filter((i) => i.marker === marker) : []),
+    ];
+    // 止めるものがあればそれを返す。無ければ「最後に立てたもの」を参考として返す
+    return candidates.find(blocksNewIssue) ?? candidates[0] ?? null;
+  };
+
+  return {
+    findings: Object.fromEntries(findings.map((f) => [f.id, pick(`f${f.id}`, Number(f.id), "f")])),
+    annotations: Object.fromEntries(annotations.map((a) => [a.id, pick(`a${a.id}`, Number(a.id), "a")])),
+  };
 }
 
 /**
@@ -452,21 +532,39 @@ app.get("/api/issues/lookup", wrap(async (req, res) => {
   if (ids.length === 0) return res.json({ findings: {}, annotations: {} });
 
   const rows = await db.acceptedFindings(ids);
-  const markers = rows.map((r) => [r.id, gh.issueMarker({
-    owner: target.owner, repo: target.repo,
-    path: r.source_ref?.path ?? r.document_title ?? "文書",
-    ruleId: r.rule_id, evidence: r.evidence ?? r.message,
-  })]);
-  const found = await db.findIssuesByMarkers(target.owner, target.repo, markers.map(([, m]) => m));
-  await refreshStaleStates(target, [...found.values()], auth.tokenFor(req));
+  const token = auth.sessionOf(req)?.token ?? null;
+  const r = await resolveIssued(target, { findings: rows }, token);
   const out = {};
-  for (const [id, m] of markers) {
-    const hit = found.get(m);
-    // 閉じているものは「再発として立てられる」ことが分かるよう state も返す
-    if (hit) out[id] = { number: hit.number, htmlUrl: hit.html_url, state: hit.state };
+  for (const row of rows) {
+    const hit = r.findings[row.id];
+    if (hit) {
+      out[row.id] = {
+        number: hit.number, htmlUrl: hit.html_url,
+        state: hit.state, stateReason: hit.state_reason,
+        // 起票を止めるかどうか。closed でも not_planned なら止める
+        blocks: blocksNewIssue(hit),
+      };
+    }
   }
   res.json({ findings: out, annotations: {} });
 }));
+
+/**
+ * 指摘1件ぶんの鍵。起票側と解決側で同じものを使う。
+ *
+ * col を入れる。L1 の evidence は「その行の全文」なので、同じ行に出た
+ * 別の指摘 (別の助詞など) が evidence まで一致し、片方を起票すると
+ * もう片方が永久に起票できなくなる。col は行がずれても変わらないので、
+ * 「行のずれには強く、同じ行の別指摘は区別する」を両立できる。
+ */
+function findingMarker(target, f) {
+  const srcPath = f.source_ref?.path ?? f.document_title ?? "文書";
+  return gh.issueMarker({
+    owner: target.owner, repo: target.repo, path: srcPath,
+    ruleId: f.rule_id,
+    evidence: [String(f.col ?? ""), f.evidence ?? f.message],
+  });
+}
 
 /**
  * 注釈1件ぶんの重複防止の鍵。起票側と一覧側で同じものを使う。
@@ -481,26 +579,6 @@ function annotationMarker(target, a) {
     ruleId: `human/${a.aspect_id ?? "unclassified"}`,
     evidence: a.quoted_text,
   });
-}
-
-/**
- * 起票済みかを判断する。閉じている issue は「直したが再発した」と扱い、
- * 新しく立てられるようにする。
- *
- * 返り値: {issue, open} — open が false なら起票してよい。
- */
-async function issueStateFor(target, marker, token) {
-  const existing = await db.findIssue(target.owner, target.repo, marker);
-  if (!existing) return { issue: null, open: false };
-  try {
-    const live = await gh.getIssue(target.owner, target.repo, existing.number, { token });
-    await db.updateIssueState(existing.id, live.state);
-    return { issue: { ...existing, state: live.state }, open: live.state === "open" };
-  } catch {
-    // GitHub に届かないときは、記録している状態で判断する。
-    // 消えた issue で永久に起票できなくなるより、控えめに止める方を選ぶ。
-    return { issue: existing, open: existing.state === "open" };
-  }
 }
 
 /**
@@ -521,19 +599,22 @@ app.post("/api/annotations/issues", wrap(async (req, res) => {
   const ids = (req.body?.annotationIds ?? []).map(Number).filter(Number.isFinite);
   if (ids.length === 0) return res.status(400).json({ error: "annotationIds が空" });
 
-  const rows = await db.annotationsForIssue(ids);
+  let rows = await db.annotationsForIssue(ids);
   if (rows.length === 0) return res.status(400).json({ error: "対象の注釈がない (取り消し済みか)" });
+
+  const resolved = await resolveIssued(target, { annotations: rows }, token);
+  const prev = resolved.annotations[rows[0].id] ?? null;
+  const fresh = rows.filter((r) => !blocksNewIssue(resolved.annotations[r.id]));
+  if (fresh.length === 0) return res.json({ issue: prev, deduped: true, blocked: rows.length });
+  rows = fresh;
 
   const first = rows[0];
   const srcPath = first.source_ref?.path ?? first.document_title ?? "文書";
   const marker = rows.length === 1 ? annotationMarker(target, first) : gh.issueMarker({
     owner: target.owner, repo: target.repo, path: srcPath,
     ruleId: "human/batch",
-    evidence: rows.map((r) => `${r.start_line}:${r.quoted_text}`).join("\n"),
+    evidence: rows.map((r) => r.quoted_text),   // 配列で渡す。区切りは NUL
   });
-
-  const { issue: prev, open } = await issueStateFor(target, marker, token);
-  if (open) return res.json({ issue: prev, deduped: true });
 
   const headline = (t) => {
     const h = String(t ?? "").split(/[。\n]/)[0].trim();
