@@ -19,6 +19,12 @@ const MAX_AGE_S = 60 * 60 * 12;
 export const oauthConfigured = () =>
   Boolean(process.env.JUSTIC_OAUTH_CLIENT_ID && process.env.JUSTIC_OAUTH_CLIENT_SECRET && process.env.JUSTIC_SESSION_SECRET);
 
+// PAT モードでもセッションを張れるようにする。
+// これが無いと、未検知の記録にログインを要求した時点で一人運用では
+// 注釈がゼロになる (docs/design-01-measurement.md の 8.2)。
+export const localSessionAvailable = () =>
+  Boolean(process.env.JUSTIC_SESSION_SECRET) && !oauthConfigured();
+
 function key() {
   const secret = process.env.JUSTIC_SESSION_SECRET;
   if (!secret) throw new Error("JUSTIC_SESSION_SECRET が無い");

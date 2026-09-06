@@ -6,7 +6,7 @@ import * as db from "./db.js";
 import * as gh from "./github.js";
 import * as auth from "./auth.js";
 import { lintMarkdown } from "./lint.js";
-import { l3Enabled, runL3, ASPECTS } from "./llm.js";
+import { l3Enabled, runL3, ASPECTS, toRuntimeAspects } from "./llm.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -81,7 +81,32 @@ app.get("/auth/callback", wrap(async (req, res) => {
   res.redirect("/");
 }));
 
+// PAT モードのローカルセッション。これが無いと、注釈にログインを要求した時点で
+// 一人運用では注釈がゼロになる (docs/design-01-measurement.md の 8.2)。
+app.post("/auth/local", wrap(async (req, res) => {
+  if (!auth.localSessionAvailable()) {
+    return res.status(400).json({
+      error: auth.oauthConfigured()
+        ? "OAuth が設定済み。GitHub でログインする"
+        : "JUSTIC_SESSION_SECRET が要る",
+    });
+  }
+  const user = await db.ensureLocalUser();
+  auth.setSession(res, { userId: Number(user.id), login: user.login });
+  res.json({ login: user.login, userId: Number(user.id) });
+}));
+
 app.post("/auth/logout", (req, res) => { auth.clearSession(res); res.json({ ok: true }); });
+
+/** 注釈系はセッション必須。誰が付けたか分からない注釈が測定の基準になるのを防ぐ。 */
+function requireSession(req, res) {
+  const s = auth.sessionOf(req);
+  if (!s) {
+    res.status(401).json({ error: "ログインが要る", canLocal: auth.localSessionAvailable() });
+    return null;
+  }
+  return s;
+}
 
 app.get("/api/me", wrap(async (req, res) => {
   const s = auth.sessionOf(req);
@@ -118,16 +143,31 @@ async function reviewOne(bodyText, { title, useL3, sourceKind = "paste", sourceR
   let l3 = null;
   const findings = [...l1];
   if (wantL3) {
-    l3 = await runL3(bodyText);
+    // 観点は aspects 表が正。llm.js は実行時の情報 (ruleId、プロンプト版) を持つ。
+    const rows = await db.aspects().catch(() => []);
+    const runtime = toRuntimeAspects(rows);
+    l3 = await runL3(bodyText, runtime.length > 0 ? { aspects: runtime } : {});
     for (const f of l3.findings) {
       f.inDiff = addedLines ? (f.line != null && addedLines.has(f.line)) : null;
     }
     findings.push(...l3.findings);
   }
 
-  const review = await db.createReview(doc.id, { layers, l3ModelId: l3?.model ?? null, sourceKind, sourceRef });
-  const stored = await db.insertFindings(review.id, findings);
-  await db.finishReview(review.id);
+  // 1レビューを1トランザクションで書く。途中で落ちると findings が半分だけ入った
+  // review が finished_at NULL で残り、集計から除外する処理に頼ることになる。
+  const { review, stored } = await db.withTransaction(async (c) => {
+    const review = await db.createReview(doc.id, {
+      layers, l3ModelId: l3?.model ?? null,
+      promptVersion: l3?.runs?.map((r) => r.promptVersion).filter(Boolean).join(",") || null,
+      sourceKind, sourceRef,
+    }, c);
+    const stored = await db.insertFindings(review.id, findings, c);
+    // 観点ごとの実行記録。失敗した観点は findings 行を作らないので、
+    // これが無いと「走ったが指摘なし」と「落ちた」を区別できない。
+    for (const run of l3?.runs ?? []) await db.recordAspectRun(review.id, run, c);
+    await db.finishReview(review.id, c);
+    return { review, stored };
+  });
 
   return {
     reviewId: review.id,
@@ -155,6 +195,8 @@ app.get("/api/health", wrap(async (req, res) => {
       oauth: auth.oauthConfigured(),
     },
     me: s ? { login: s.login, userId: s.userId } : null,
+    // PAT モードでもセッションを張れるか (設計書 8.2)
+    localSession: auth.localSessionAvailable(),
     aspects: ASPECTS.map((a) => ({ id: a.id, title: a.title })),
   });
 }));
@@ -295,6 +337,82 @@ app.post("/api/issues", wrap(async (req, res) => {
     ...created, marker, findingIds: rows.map((r) => Number(r.id)), userId: actor(req).userId,
   });
   res.json({ issue: saved, deduped: false, from: rows.length });
+}));
+
+// ---- 未検知の記録 (docs/design-01-measurement.md) ----------------------
+
+app.get("/api/aspects", wrap(async (_req, res) => res.json(await db.aspects())));
+
+app.get("/api/golden-set", wrap(async (req, res) => {
+  const aspectId = String(req.query.aspect ?? "D-01");
+  const target = Math.min(Number(req.query.target ?? 20), 200);
+  res.json(await db.goldenSet(aspectId, target));
+}));
+
+app.get("/api/documents/:id/annotations", wrap(async (req, res) => {
+  const documentId = Number(req.params.id);
+  res.json({
+    annotations: await db.listAnnotations(documentId),
+    completions: await db.listCompletions(documentId),
+  });
+}));
+
+app.post("/api/documents/:id/annotations", wrap(async (req, res) => {
+  const s = requireSession(req, res);
+  if (!s) return;
+  const { startLine, endLine, quotedText, aspectId, note } = req.body ?? {};
+  if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine > endLine) {
+    return res.status(400).json({ error: "startLine / endLine が不正" });
+  }
+  if (!String(quotedText ?? "").trim()) return res.status(400).json({ error: "quotedText が空" });
+  res.json(await db.addAnnotation({
+    documentId: Number(req.params.id),
+    startLine, endLine, quotedText: String(quotedText).slice(0, 2000),
+    aspectId: aspectId || null, note, userId: s.userId,
+  }));
+}));
+
+// 取り消しは追記。物理削除しない (schema.sql の方針1)。
+for (const action of ["retract", "restore"]) {
+  app.post(`/api/annotations/:id/${action}`, wrap(async (req, res) => {
+    const s = requireSession(req, res);
+    if (!s) return;
+    const owner = await db.annotationOwner(Number(req.params.id));
+    if (!owner) return res.status(404).json({ error: "not found" });
+    if (Number(owner.user_id) !== Number(s.userId)) {
+      return res.status(403).json({ error: "自分が付けた注釈だけ" });
+    }
+    res.json(await db.annotationEvent(
+      Number(req.params.id), action === "retract" ? "retracted" : "restored",
+      s.userId, req.body?.note));
+  }));
+}
+
+// 観点の後付け。登録時は任意にして手間を減らしている (設計書 5章)。
+app.patch("/api/annotations/:id", wrap(async (req, res) => {
+  const s = requireSession(req, res);
+  if (!s) return;
+  const row = await db.setAnnotationAspect(Number(req.params.id), req.body?.aspectId ?? null);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+}));
+
+// 全数注釈の印。注釈0件でも立てられる。
+// ゼロは「システムが全部拾った」という正の情報で、recall=1.0 側の標本になる。
+app.post("/api/documents/:id/completions", wrap(async (req, res) => {
+  const s = requireSession(req, res);
+  if (!s) return;
+  const aspectId = String(req.body?.aspectId ?? "");
+  if (!aspectId) return res.status(400).json({ error: "aspectId が要る" });
+  res.json(await db.addCompletion(Number(req.params.id), aspectId, s.userId));
+}));
+
+app.delete("/api/documents/:id/completions/:aspectId", wrap(async (req, res) => {
+  const s = requireSession(req, res);
+  if (!s) return;
+  const row = await db.revokeCompletion(Number(req.params.id), req.params.aspectId, s.userId);
+  if (!row) return res.status(404).json({ error: "自分が立てた印が無い" });
+  res.json(row);
 }));
 
 // ループバックだけで待つ。ミラーリングモードの WSL では 0.0.0.0 にすると

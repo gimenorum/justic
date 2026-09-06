@@ -8,7 +8,7 @@
 |---|---|
 | [要件](docs/design-review-api-requirements-v2.md) | 層の構成、検出対象、評価。草案は [こちら](docs/design-review-api-requirements.md) |
 | [追加設計の地図](docs/design-00-overview.md) | 4本への分割、依存の順序、共通の決定 |
-| [01 測定](docs/design-01-measurement.md) | 未検知の記録と recall。**書いた** |
+| [01 測定](docs/design-01-measurement.md) | 未検知の記録と recall。**実装済み** |
 | [02 実行基盤](docs/design-02-runtime.md) / [03 入力](docs/design-03-input.md) / [04 観点](docs/design-04-aspects.md) | 未着手。解くべき問題の一覧 |
 
 ## 起動
@@ -106,6 +106,23 @@ OAuth App は GitHub の Settings > Developer settings で作る。
 - **採否は追記のみ。** 押し直しても前の行は消えない。訂正の履歴が残るので学習データを戻せる。
 - **「無視」と「却下」を分ける。** 判断していないものは `labeled_findings` に入らない。閉じただけのものを負例にしない。
 - **出し方を記録する。** `exposure` が `ranked` / `random` / `hidden`。出さなかったものは教師にせず、無作為に混ぜた分は区別する。
+
+## 見落としを記録する
+
+採否だけでは precision しか測れない。システムが**出さなかった**指摘を記録しないと
+recall の分母が作れない。「本文と注釈」を開くと本文が行番号つきで出るので、
+行をクリックして範囲を選び「ここが問題」で登録する。
+
+```sh
+cd tuning && ../.venv/bin/python measure_recall.py --aspect D-01 --save
+```
+
+**「この観点は全部見た」を押した文書だけ**が集計の対象になる。押していない文書を
+混ぜると、注釈ゼロの文書が分子にだけ寄与し recall が自動的に 1.0 に近づく。
+注釈が0件でも押してよい。ゼロは「システムが全部拾った」という記録になる。
+
+注釈は `findings` に入れず別表に持つ。`findings` は review 単位なので、
+再レビューすると注釈が古い review に取り残されるため。
 
 ## 環境
 

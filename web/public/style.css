@@ -96,3 +96,23 @@ footer { border-top: 1px solid var(--line); padding: 10px 24px; display: flex; g
 .login { display: inline-block; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--accent);
          color: var(--accent); text-decoration: none; font-weight: 600; }
 .login:hover { background: var(--accent); color: #fff; }
+
+/* 本文の表示と注釈 */
+.annot-panel { border: 1px solid var(--line); border-radius: 6px; background: var(--card); margin-bottom: 10px; }
+.annot-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.annot-head .grow { flex: 1; }
+.annot-body { max-height: 46vh; overflow: auto; font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.65; }
+.ln { display: flex; gap: 10px; padding: 0 12px; cursor: pointer; white-space: pre-wrap; word-break: break-all; }
+.ln:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.ln .num { flex: 0 0 3.2em; text-align: right; color: var(--muted); user-select: none; }
+.ln.sel { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.ln.has-annot { border-left: 3px solid var(--warn); margin-left: -3px; }
+.ln.has-finding { border-left: 3px solid var(--info); margin-left: -3px; }
+.ln.has-annot.has-finding { border-left-color: var(--accent); }
+.annot-list { padding: 8px 12px; border-top: 1px solid var(--line); font-size: 12px; }
+.annot-item { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; color: var(--muted); }
+.annot-item.gone { text-decoration: line-through; opacity: .55; }
+.annot-item .q { color: var(--fg); }
+.aspect-runs { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted); padding: 6px 12px; }
+.aspect-runs .st-ok { color: var(--accent); } .aspect-runs .st-empty { color: var(--muted); }
+.aspect-runs .st-timeout, .aspect-runs .st-error, .aspect-runs .st-parse_error { color: var(--error); }

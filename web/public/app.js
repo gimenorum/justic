@@ -103,6 +103,153 @@ function findingCard(f, review) {
   return el;
 }
 
+// ---- 本文の表示と注釈 --------------------------------------------------
+//
+// 見落としの登録は、システムの指摘を判断している最中に、同じ画面で取る。
+// 別画面に移らせるとそこで止まる (docs/design-01-measurement.md の 4.3)。
+
+async function annotationPanel(reviewId) {
+  const panel = document.createElement("div");
+  panel.className = "annot-panel";
+  panel.innerHTML = '<div class="annot-head"><span class="grow">読み込み中…</span></div>';
+
+  const full = await api(`/api/reviews/${reviewId}`);
+  const docId = full.document_id;
+  let data = await api(`/api/documents/${docId}/annotations`);
+  const aspectId = state.health.aspects?.[0]?.id ?? "D-01";
+  const lines = String(full.body ?? "").split("\n");
+  let sel = null;   // {start, end}
+
+  const findingLines = new Set(full.findings.map((f) => f.line).filter(Boolean));
+
+  function draw() {
+    panel.innerHTML = "";
+    const live = data.annotations.filter((a) => !a.retracted);
+    const annotLines = new Set();
+    for (const a of live) for (let i = a.start_line; i <= a.end_line; i += 1) annotLines.add(i);
+    const done = data.completions.some((c) => c.aspect_id === aspectId && !c.revoked_at);
+
+    const head = document.createElement("div");
+    head.className = "annot-head";
+    head.innerHTML = `<span class="grow">本文 ${lines.length} 行
+      <span class="who">行をクリックで選択、Shift+クリックで範囲</span></span>`;
+
+    const mark = Object.assign(document.createElement("button"), {
+      textContent: done ? `✓ ${aspectId} は全部見た` : `${aspectId} を全部見た`,
+      className: done ? "small" : "ghost small",
+    });
+    mark.title = "注釈が0件でも押せる。ゼロは「システムが全部拾った」という記録になる";
+    mark.onclick = async () => {
+      try {
+        if (done) {
+          await fetch(`/api/documents/${docId}/completions/${aspectId}`, { method: "DELETE" });
+        } else {
+          await api(`/api/documents/${docId}/completions`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ aspectId }),
+          });
+        }
+        data = await api(`/api/documents/${docId}/annotations`);
+        draw(); refreshStats();
+      } catch (e) { alert(needLogin(e)); }
+    };
+    head.appendChild(mark);
+    panel.appendChild(head);
+
+    if (full.aspectRuns?.length) {
+      const runs = document.createElement("div");
+      runs.className = "aspect-runs";
+      runs.innerHTML = "走った観点: " + full.aspectRuns.map((r) =>
+        `<span class="st-${r.status}">${r.aspect_id} ${r.status}${r.error ? " — " + r.error.slice(0, 40) : ""}</span>`
+      ).join(" / ");
+      panel.appendChild(runs);
+    }
+
+    const body = document.createElement("div");
+    body.className = "annot-body";
+    lines.forEach((text, i) => {
+      const n = i + 1;
+      const el = document.createElement("div");
+      el.className = "ln"
+        + (annotLines.has(n) ? " has-annot" : "")
+        + (findingLines.has(n) ? " has-finding" : "")
+        + (sel && n >= sel.start && n <= sel.end ? " sel" : "");
+      el.innerHTML = '<span class="num"></span><span class="txt"></span>';
+      el.querySelector(".num").textContent = n;
+      el.querySelector(".txt").textContent = text || " ";
+      el.onclick = (ev) => {
+        sel = ev.shiftKey && sel
+          ? { start: Math.min(sel.start, n), end: Math.max(sel.end, n) }
+          : { start: n, end: n };
+        draw();
+      };
+      body.appendChild(el);
+    });
+    panel.appendChild(body);
+
+    if (sel) {
+      const bar = document.createElement("div");
+      bar.className = "annot-list";
+      const quoted = lines.slice(sel.start - 1, sel.end).join("\n");
+      const note = Object.assign(document.createElement("input"), { placeholder: "何が問題か (任意)" });
+      const add = Object.assign(document.createElement("button"), { textContent: "ここが問題", className: "primary small" });
+      add.onclick = async () => {
+        add.disabled = true;
+        try {
+          await api(`/api/documents/${docId}/annotations`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ startLine: sel.start, endLine: sel.end, quotedText: quoted, note: note.value }),
+          });
+          sel = null;
+          data = await api(`/api/documents/${docId}/annotations`);
+          draw(); refreshStats();
+        } catch (e) { alert(needLogin(e)); add.disabled = false; }
+      };
+      const row = document.createElement("div");
+      row.className = "row";
+      row.append(note, add);
+      bar.append(Object.assign(document.createElement("div"), {
+        className: "annot-item", textContent: `L${sel.start}-${sel.end} を選択中`,
+      }), row);
+      panel.appendChild(bar);
+    }
+
+    if (data.annotations.length) {
+      const list = document.createElement("div");
+      list.className = "annot-list";
+      for (const a of data.annotations) {
+        const item = document.createElement("div");
+        item.className = "annot-item" + (a.retracted ? " gone" : "");
+        item.innerHTML = `<span>L${a.start_line}-${a.end_line}</span>
+          <span class="q"></span><span>${a.aspect_id ?? "未分類"} / @${a.author}</span>`;
+        item.querySelector(".q").textContent = (a.note || a.quoted_text).slice(0, 60);
+        const undo = Object.assign(document.createElement("button"), {
+          textContent: a.retracted ? "戻す" : "取消", className: "ghost small",
+        });
+        undo.onclick = async () => {
+          try {
+            await api(`/api/annotations/${a.id}/${a.retracted ? "restore" : "retract"}`,
+              { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            data = await api(`/api/documents/${docId}/annotations`);
+            draw(); refreshStats();
+          } catch (e) { alert(needLogin(e)); }
+        };
+        item.appendChild(undo);
+        list.appendChild(item);
+      }
+      panel.appendChild(list);
+    }
+  }
+
+  draw();
+  return panel;
+}
+
+const needLogin = (e) =>
+  /ログインが要る/.test(e.message)
+    ? "注釈にはログインが要ります。ヘッダからログインして下さい。"
+    : `保存できなかった: ${e.message}`;
+
 function reviewBlock(r) {
   const wrap = document.createElement("div");
   wrap.className = "review";
@@ -112,6 +259,21 @@ function reviewBlock(r) {
   const accepted = r.findings.filter((f) => f.verdict === "accepted");
   head.innerHTML = `<span class="rtitle"></span><span class="rmeta">${r.findings.length}件</span>`;
   head.querySelector(".rtitle").textContent = r.title ?? `review ${r.reviewId}`;
+
+  // 見落としを登録する。R-04 (使われなければ recall が永久に測れない) への手当て。
+  const annot = Object.assign(document.createElement("button"), {
+    textContent: "本文と注釈", className: "ghost small",
+  });
+  annot.onclick = async () => {
+    const existing = wrap.querySelector(".annot-panel");
+    if (existing) { existing.remove(); return; }
+    annot.disabled = true;
+    try {
+      wrap.insertBefore(await annotationPanel(r.reviewId), wrap.children[1] ?? null);
+    } catch (e) { alert(`開けなかった: ${e.message}`); }
+    annot.disabled = false;
+  };
+  head.appendChild(annot);
 
   if (accepted.length > 0 && state.health.github?.token) {
     const bulk = Object.assign(document.createElement("button"), {
@@ -247,6 +409,8 @@ async function refreshStats() {
     $("stats").innerHTML = [
       ["文書", s.documents], ["レビュー", s.reviews], ["提示した指摘", s.shown],
       ["採用", s.accepted], ["却下", s.rejected],
+      // 沈黙の可視化。ゼロに近ければ未検知の記録が使われていない (設計書 4.4)
+      ["注釈", s.annotations], ["全数注釈済み", s.completed_documents],
     ].map(([k, v]) => `${k} <b>${v}</b>`).join("");
   } catch { /* 統計が出ないだけ */ }
 }
@@ -275,6 +439,21 @@ function renderAccount(h) {
       note.textContent = ".env の PAT で動作中";
       box.appendChild(note);
     }
+  } else if (h.localSession) {
+    // OAuth 未設定でも注釈は付けられるようにする。
+    // ログインを要求したまま手段が無いと、一人運用で注釈がゼロになる (設計書 8.2)。
+    const btn = Object.assign(document.createElement("button"), {
+      textContent: "この機械のセッションで入る", className: "ghost small",
+    });
+    btn.onclick = async () => {
+      try { await api("/auth/local", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); location.reload(); }
+      catch (e) { alert(e.message); }
+    };
+    box.appendChild(btn);
+    const note = document.createElement("span");
+    note.className = "who";
+    note.textContent = h.github.token ? ".env の PAT で動作中" : "GitHub 未接続";
+    box.appendChild(note);
   } else {
     const note = document.createElement("span");
     note.className = "who";
