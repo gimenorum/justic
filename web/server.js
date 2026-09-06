@@ -13,6 +13,31 @@ const app = express();
 const PORT = Number(process.env.PORT ?? 5180);
 const ORIGIN = process.env.JUSTIC_ORIGIN ?? `http://127.0.0.1:${PORT}`;
 
+// ループバックで待っていても、この機械の上のブラウザからは誰でも届く。
+// 利用者が踏んだ外部のページから POST されると、.env の PAT モードでは
+// cookie 無しで通ってしまい、勝手に issue が立つ。
+//
+// Origin が違えば弾く。Origin を偽れないのがブラウザの前提なので、これで足りる。
+// Host も見る。攻撃者のドメインを 127.0.0.1 に向ける DNS リバインディングを塞ぐ。
+const ALLOWED_HOSTS = new Set([
+  `127.0.0.1:${PORT}`, `localhost:${PORT}`, `[::1]:${PORT}`,
+  ...(process.env.JUSTIC_ORIGIN ? [new URL(process.env.JUSTIC_ORIGIN).host] : []),
+]);
+
+app.use((req, res, next) => {
+  if (req.headers.host && !ALLOWED_HOSTS.has(req.headers.host)) {
+    return res.status(403).json({ error: `Host ${req.headers.host} は許可していない` });
+  }
+  // 読み取りは通す。状態を変えるものだけ Origin を見る。
+  if (req.method === "GET" || req.method === "HEAD") return next();
+  const origin = req.headers.origin;
+  // Origin が無いのは curl などの非ブラウザ。ブラウザは他所からの POST に必ず付ける。
+  if (origin && !ALLOWED_HOSTS.has(new URL(origin).host)) {
+    return res.status(403).json({ error: `Origin ${origin} からは受け付けない` });
+  }
+  next();
+});
+
 app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(here, "public")));
 
