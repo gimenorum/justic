@@ -1,14 +1,15 @@
-// L3: 観点別のパス。1プロンプトに1観点しか入れない (要件 L3-01)。
+// L3: LLM に設計書を読ませて、1つの観点について指摘させる。
+// 1プロンプトに1観点しか入れない (要件 L3-01)。
 //
-// 既定では無効。JUSTIC_L3=1 で有効になる。
-// 推論サーバーは別プロセスが使っていることがあるので、勝手に叩かない。
+// これがこの道具の本体なので既定で有効。JUSTIC_L3=0 で切れる。
+// 推論サーバーが居なければ L1 の結果だけを返し、理由を画面に出す。
 
 const BASE_URL = process.env.JUSTIC_BASE_URL ?? "http://127.0.0.1:18080/v1";
 const API_KEY = process.env.JUSTIC_API_KEY ?? "";
 const MODEL = process.env.JUSTIC_MODEL ?? "";
 const TIMEOUT_MS = Number(process.env.JUSTIC_L3_TIMEOUT_MS ?? 120000);
 
-export const l3Enabled = () => process.env.JUSTIC_L3 === "1";
+export const l3Enabled = () => process.env.JUSTIC_L3 !== "0";
 
 // 観点。増やすときは1件ずつ足し、評価を通してから次に行く (要件 L3-02)。
 export const ASPECTS = [
@@ -65,6 +66,13 @@ async function chat(messages) {
     if (!res.ok) throw new Error(`${res.status} ${await res.text().catch(() => "")}`.slice(0, 200));
     const json = await res.json();
     return json.choices?.[0]?.message?.content ?? "";
+  } catch (e) {
+    // サーバーが起きていないのが一番ありがちなので、そう読める文にする。
+    if (e.name === "AbortError") throw new Error(`${TIMEOUT_MS / 1000}秒で応答が無い (${BASE_URL})`);
+    if (e.cause?.code === "ECONNREFUSED" || /fetch failed/i.test(e.message)) {
+      throw new Error(`推論サーバーに繋がらない (${BASE_URL})。起動しているか確認する`);
+    }
+    throw e;
   } finally {
     clearTimeout(timer);
   }

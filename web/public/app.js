@@ -217,7 +217,7 @@ $("run").onclick = async () => {
 
     const notes = [];
     const notChecked = reviews.some((x) => x.notChecked?.length);
-    if (notChecked) notes.push("未検査: L3 (設計内容)。文体が通っても設計の妥当性は見ていない。");
+    if (notChecked) notes.push("未検査: 設計チェック (LLM)。文体が通っても設計の妥当性は見ていない。");
     const outside = reviews.reduce((n, x) => n + (x.l1OutsideDiff ?? 0), 0);
     if (outside) notes.push(`差分の外にある文体指摘 ${outside}件は出していない (この PR が持ち込んだものではない)。`);
     const dropped = reviews.reduce((n, x) => n + (x.droppedByEvidenceCheck ?? 0), 0);
@@ -291,7 +291,7 @@ function renderAccount(h) {
     $("health").textContent =
       `DB ${h.db} / L3 ${h.l3 ? "有効" : "無効"} / GitHub ${h.github.viaLogin ? "ログイン中" : h.github.token ? ".env の PAT" : "未接続"} / 観点 ${h.aspects.map((a) => a.id).join(", ")}`;
     $("useL3").disabled = !h.l3;
-    if (!h.l3) $("useL3").parentElement.title = "JUSTIC_L3=1 で有効になる";
+    if (!h.l3) { $("useL3").checked = false; $("useL3").parentElement.title = "JUSTIC_L3=0 で切ってある"; }
     if (!h.github.token) $("issueRepo").placeholder = "GitHub にログインすると起票できる";
   } catch (e) {
     $("health").textContent = `接続できない: ${e.message}`;
