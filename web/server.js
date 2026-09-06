@@ -33,6 +33,13 @@ app.get("/auth/login", (req, res) => {
   if (!auth.oauthConfigured()) {
     return res.status(400).send("OAuth が未設定。JUSTIC_OAUTH_CLIENT_ID / _SECRET / JUSTIC_SESSION_SECRET を .env に入れる");
   }
+  // cookie はホストごとに付く。localhost で開いて callback が 127.0.0.1 だと、
+  // セッションが別の origin に付いて未ログインに見える。
+  // 先に正規の origin へ寄せてから OAuth に出す。
+  const canonicalHost = new URL(ORIGIN).host;
+  if (req.headers.host && req.headers.host !== canonicalHost) {
+    return res.redirect(`${ORIGIN}/auth/login`);
+  }
   res.redirect(auth.authorizeUrl(auth.makeState()));
 });
 
@@ -258,7 +265,28 @@ app.post("/api/issues", wrap(async (req, res) => {
   res.json({ issue: saved, deduped: false, from: rows.length });
 }));
 
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`justic  ${ORIGIN}`);
-  console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=1)"}   OAuth: ${auth.oauthConfigured() ? "設定済み" : "未設定"}   .env の PAT: ${gh.envToken() ? "あり" : "なし"}`);
-});
+// ループバックだけで待つ。ミラーリングモードの WSL では 0.0.0.0 にすると
+// LAN の他の端末から届いてしまい、GitHub のトークンを持った画面が外に出る。
+//
+// IPv4 と IPv6 の両方で待つ。Windows 側のブラウザは localhost を ::1 から
+// 先に引くので、127.0.0.1 だけだとフォールバック頼みになる。
+const hosts = ["127.0.0.1", "::1"];
+let ready = 0;
+for (const host of hosts) {
+  const server = app.listen(PORT, host, () => {
+    ready += 1;
+    if (ready === 1) {
+      console.log(`justic  ${ORIGIN}`);
+      console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=1)"}   OAuth: ${auth.oauthConfigured() ? "設定済み" : "未設定"}   .env の PAT: ${gh.envToken() ? "あり" : "なし"}`);
+    }
+    console.log(`  待ち受け ${host.includes(":") ? `[${host}]` : host}:${PORT}`);
+  });
+  server.on("error", (e) => {
+    if (host === "::1" && (e.code === "EAFNOSUPPORT" || e.code === "EADDRNOTAVAIL")) {
+      console.log(`  IPv6 は使えない環境のため ${host} は省略した`);
+      return;
+    }
+    console.error(`待ち受けに失敗 ${host}:${PORT}  ${e.code ?? e.message}`);
+    if (ready === 0) process.exit(1);
+  });
+}
