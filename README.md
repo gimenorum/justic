@@ -81,6 +81,45 @@ chmod 600 ~/.config/justic/openrouter-key
 キーファイルは呼び出しのたびに読み直すので、キーの差し替え (失効・再発行) は
 再起動なしで効く。詳しくは [設計 05](docs/design-05-llm-endpoints.md)。
 
+## MCP から使う
+
+Claude Code のような AI の道具から、justic の検査・採否を直接呼べる。justic の
+プロセスが `/mcp` (Streamable HTTP) で受ける。別のプロセスは立たない。
+
+```sh
+claude mcp add --transport http --scope user justic http://127.0.0.1:5180/mcp
+```
+
+登録したら Claude Code を起動し直す (設定は起動時にしか読まない)。justic は先に
+起動しておく。止まっていると、そのセッションではツールが見えない。
+
+ツールは 8 つ。Claude Code の中では `mcp__justic__review_document` のような
+名前で見える。
+
+| ツール | すること |
+|---|---|
+| `health` | DB・L3・接続先・GitHub トークンの有無を返す |
+| `stats` | 文書・レビュー・指摘・採否・注釈の件数を返す |
+| `list_reviews` | 最近のレビューを新しい順に返す |
+| `get_review` | レビュー1件の指摘を返す |
+| `review_document` | 文書を1件検査する。本文は `body` か、絶対パスの `path` で渡す |
+| `review_pull_request` | GitHub の PR が変更した Markdown を検査する |
+| `review_branch` | リポジトリ (既定はデフォルトブランチ) の Markdown を検査する |
+| `set_verdict` | 指摘の採否 (`accepted` / `rejected`) を記録する |
+
+**本文は返さない。** `get_review` は文書の本文 (`body`) を含めない。justic の DB
+に溜まった実務の文書を、AI の道具が番号だけで読めてしまうのを防ぐため。指摘の
+`evidence` (該当行) は返す。
+
+**`useL3` は `endpoint` を名前で指定したときだけ走る。** 省略すると L1 (文体) だけで
+終わる。`useL3: true` で `endpoint` を省くと拒む。`endpoint` に外部
+(`external: true`) の接続先を指定しても拒む。外部の接続先を選ぶのは画面からだけ。
+
+**MCP から押した採否は `decided_by = 'mcp'` として記録される。** 画面から人が
+押したものとは値で区別できる。
+
+詳しくは [設計 06](docs/design-06-mcp.md)。
+
 ## 対象の選び方
 
 | モード | 何を見るか |

@@ -8,6 +8,7 @@ import * as auth from "./auth.js";
 import { lintMarkdown } from "./lint.js";
 import { l3Enabled, runL3, ASPECTS, toRuntimeAspects } from "./llm.js";
 import * as endpoints from "./endpoints.js";
+import { mcpHandler } from "./mcp.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -51,6 +52,16 @@ app.use((req, res, next) => {
   next();
 });
 
+// /mcp は express.json() より前に置く。toNodeHandler (@modelcontextprotocol/node)
+// が返す (req, res, parsedBody?) は、parsedBody を渡さなければ req から自分で
+// 本文を読み直す (node_modules/@modelcontextprotocol/node/dist/index.d.mts の
+// toNodeHandler / NodeMcpRequestHandler の記述)。express.json() が先に本文を
+// 読んでしまうと、その後ろでは req の流れが空になり MCP 側が読めなくなる。
+// Host/Origin の検査 (上のミドルウェア) は既に通ったあとなので、/mcp にも掛かっている。
+app.all("/mcp", mcpHandler({
+  runPasteReview, runPullRequestReview, runBranchReview, runVerdict, buildHealth, db,
+}));
+
 app.use(express.json({ limit: "8mb" }));
 app.use(express.static(path.join(here, "public")));
 
@@ -77,9 +88,11 @@ function parseOrigin(raw) {
  * 要求本文の endpoint を接続先に解決する。無ければ既定、既定が無ければ失敗。
  * 設定に無い名前も失敗で、選べる名前を文言に並べる (docs/design-05-llm-endpoints.md の 6.1)。
  * 呼び出し側で 400 にする。
+ *
+ * body は要求本文そのもの (HTTP なら req.body、MCP ならツールの引数)。
  */
-function parseEndpoint(req) {
-  const requested = req.body?.endpoint;
+function parseEndpoint(body) {
+  const requested = body?.endpoint;
   if (requested === undefined || requested === null || requested === "") {
     const name = endpoints.defaultName();
     if (!name) return { error: "接続先 (endpoint) を選ぶ。既定が決まっていない" };
@@ -97,9 +110,9 @@ function parseEndpoint(req) {
  * この要求で L3 を走らせるか。useL3 が立っていて L3 が使えるときだけ、
  * 接続先を解決する。L3 を求めていない要求まで endpoint を必須にしない。
  */
-function endpointForRequest(req) {
-  if (!req.body?.useL3 || !l3Available()) return { endpoint: null };
-  return parseEndpoint(req);
+function endpointForRequest(body) {
+  if (!body?.useL3 || !l3Available()) return { endpoint: null };
+  return parseEndpoint(body);
 }
 
 // ---- 認証 --------------------------------------------------------------
@@ -245,24 +258,36 @@ async function reviewOne(bodyText, { title, endpoint = null, origin = "model", s
   };
 }
 
-app.get("/api/health", wrap(async (req, res) => {
+/**
+ * GET /api/health の中身。HTTP からも MCP (health ツール) からも呼ぶ (4.1)。
+ * session はログインしている利用者のセッション (auth.sessionOf の結果)。
+ * MCP には cookie が無いので null を渡す (docs/design-06-mcp.md 4.2)。
+ */
+async function buildHealth(session) {
   await db.ping();
-  const s = auth.sessionOf(req);
-  res.json({
-    db: "ok",
-    l3: l3Available(),
-    endpoints: await endpoints.describe(),
-    github: {
-      // ログインしていればその人のトークン、していなければ .env の PAT
-      token: gh.hasToken(s?.token),
-      viaLogin: Boolean(s?.token),
-      oauth: auth.oauthConfigured(),
+  return {
+    status: 200,
+    json: {
+      db: "ok",
+      l3: l3Available(),
+      endpoints: await endpoints.describe(),
+      github: {
+        // ログインしていればその人のトークン、していなければ .env の PAT
+        token: gh.hasToken(session?.token),
+        viaLogin: Boolean(session?.token),
+        oauth: auth.oauthConfigured(),
+      },
+      me: session ? { login: session.login, userId: session.userId } : null,
+      // PAT モードでもセッションを張れるか (設計書 8.2)
+      localSession: auth.localSessionAvailable(),
+      aspects: ASPECTS.map((a) => ({ id: a.id, title: a.title })),
     },
-    me: s ? { login: s.login, userId: s.userId } : null,
-    // PAT モードでもセッションを張れるか (設計書 8.2)
-    localSession: auth.localSessionAvailable(),
-    aspects: ASPECTS.map((a) => ({ id: a.id, title: a.title })),
-  });
+  };
+}
+
+app.get("/api/health", wrap(async (req, res) => {
+  const r = await buildHealth(auth.sessionOf(req));
+  res.status(r.status).json(r.json);
 }));
 
 app.get("/api/stats", wrap(async (_req, res) => res.json(await db.stats())));
@@ -274,32 +299,44 @@ app.get("/api/reviews/:id", wrap(async (req, res) => {
   res.json({ ...review, issues: await db.issuesForReview(review.id) });
 }));
 
-app.post("/api/reviews", wrap(async (req, res) => {
-  const body = String(req.body?.body ?? "").trim();
-  if (!body) return res.status(400).json({ error: "本文が空です" });
-  const title = req.body?.title ? String(req.body.title).slice(0, 200) : null;
-  const origin = parseOrigin(req.body?.origin);
-  if (origin === null) return res.status(400).json({ error: "origin は 'model' か 'human'" });
-  const picked = endpointForRequest(req);
-  if (picked.error) return res.status(400).json({ error: picked.error });
-  const result = await reviewOne(body, { title, endpoint: picked.endpoint, origin });
+/**
+ * POST /api/reviews (貼り付け経路) の中身。HTTP からも MCP (review_document ツール) からも呼ぶ (4.1)。
+ * body は要求本文そのもの (req.body 相当。body.body が文書本文)。
+ * token はこの経路では使わない (GitHub を呼ばないため)。他の run* と型を揃えている。
+ */
+async function runPasteReview(body, { token } = {}) {
+  const text = String(body?.body ?? "").trim();
+  if (!text) return { status: 400, json: { error: "本文が空です" } };
+  const title = body?.title ? String(body.title).slice(0, 200) : null;
+  const origin = parseOrigin(body?.origin);
+  if (origin === null) return { status: 400, json: { error: "origin は 'model' か 'human'" } };
+  const picked = endpointForRequest(body);
+  if (picked.error) return { status: 400, json: { error: picked.error } };
+  const result = await reviewOne(text, { title, endpoint: picked.endpoint, origin });
   // 貼り付け経路はファイルが1つなので notScanned は常に空 (14.3)
-  res.json({ ...result, notScanned: [] });
+  return { status: 200, json: { ...result, notScanned: [] } };
+}
+
+app.post("/api/reviews", wrap(async (req, res) => {
+  const r = await runPasteReview(req.body, { token: auth.tokenFor(req) });
+  res.status(r.status).json(r.json);
 }));
 
-app.post("/api/reviews/github/pr", wrap(async (req, res) => {
-  const ref = gh.parsePullRef(req.body?.ref);
-  if (!ref) return res.status(400).json({ error: "PR の URL か owner/repo#番号 を渡す" });
-  const origin = parseOrigin(req.body?.origin);
-  if (origin === null) return res.status(400).json({ error: "origin は 'model' か 'human'" });
-  const picked = endpointForRequest(req);
-  if (picked.error) return res.status(400).json({ error: picked.error });
-  const token = auth.tokenFor(req);
+/**
+ * POST /api/reviews/github/pr の中身。HTTP からも MCP (review_pull_request ツール) からも呼ぶ (4.1)。
+ */
+async function runPullRequestReview(body, { token }) {
+  const ref = gh.parsePullRef(body?.ref);
+  if (!ref) return { status: 400, json: { error: "PR の URL か owner/repo#番号 を渡す" } };
+  const origin = parseOrigin(body?.origin);
+  if (origin === null) return { status: 400, json: { error: "origin は 'model' か 'human'" } };
+  const picked = endpointForRequest(body);
+  if (picked.error) return { status: 400, json: { error: picked.error } };
 
   const pr = await gh.getPull(ref.owner, ref.repo, ref.number, { token });
   const files = await gh.getMarkdownFiles(ref.owner, ref.repo, ref.number, { headSha: pr.headSha, token });
   if (files.length === 0) {
-    return res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews: [], note: "この PR は Markdown を変更していない", stopped: null, notScanned: [] });
+    return { status: 200, json: { kind: "pr", pr: { ...pr, ...ref }, reviews: [], note: "この PR は Markdown を変更していない", stopped: null, notScanned: [] } };
   }
 
   // 接続先は1回の要求で1つ (6.1)。ファイルごとに選び直さない。
@@ -337,27 +374,34 @@ app.post("/api/reviews/github/pr", wrap(async (req, res) => {
     }
     prevFailureKind = result.l3Failure ? result.l3Failure.kind : null;
   }
-  res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews, stopped, notScanned });
+  return { status: 200, json: { kind: "pr", pr: { ...pr, ...ref }, reviews, stopped, notScanned } };
+}
+
+app.post("/api/reviews/github/pr", wrap(async (req, res) => {
+  const r = await runPullRequestReview(req.body, { token: auth.tokenFor(req) });
+  res.status(r.status).json(r.json);
 }));
 
-app.post("/api/reviews/github/branch", wrap(async (req, res) => {
-  const ref = gh.parseRepoRef(req.body?.ref);
-  if (!ref) return res.status(400).json({ error: "リポジトリの URL か owner/repo を渡す" });
-  const origin = parseOrigin(req.body?.origin);
-  if (origin === null) return res.status(400).json({ error: "origin は 'model' か 'human'" });
-  const picked = endpointForRequest(req);
-  if (picked.error) return res.status(400).json({ error: picked.error });
-  const token = auth.tokenFor(req);
+/**
+ * POST /api/reviews/github/branch の中身。HTTP からも MCP (review_branch ツール) からも呼ぶ (4.1)。
+ */
+async function runBranchReview(body, { token }) {
+  const ref = gh.parseRepoRef(body?.ref);
+  if (!ref) return { status: 400, json: { error: "リポジトリの URL か owner/repo を渡す" } };
+  const origin = parseOrigin(body?.origin);
+  if (origin === null) return { status: 400, json: { error: "origin は 'model' か 'human'" } };
+  const picked = endpointForRequest(body);
+  if (picked.error) return { status: 400, json: { error: picked.error } };
 
   const repo = await gh.getRepo(ref.owner, ref.repo, { token });
-  const branch = req.body?.branch || repo.defaultBranch;
+  const branch = body?.branch || repo.defaultBranch;
   const { paths, total, truncated } = await gh.listMarkdown(ref.owner, ref.repo, branch, {
-    maxFiles: Math.min(Number(req.body?.maxFiles ?? 10), 50),
-    prefix: req.body?.prefix ?? "",
+    maxFiles: Math.min(Number(body?.maxFiles ?? 10), 50),
+    prefix: body?.prefix ?? "",
     token,
   });
   if (paths.length === 0) {
-    return res.json({ kind: "branch", repo: { ...ref, branch }, reviews: [], note: "Markdown が無い", stopped: null, notScanned: [] });
+    return { status: 200, json: { kind: "branch", repo: { ...ref, branch }, reviews: [], note: "Markdown が無い", stopped: null, notScanned: [] } };
   }
 
   // 接続先は1回の要求で1つ (6.1)。ファイルごとに選び直さない。
@@ -367,8 +411,8 @@ app.post("/api/reviews/github/branch", wrap(async (req, res) => {
   let prevFailureKind = null;
   for (let i = 0; i < paths.length; i += 1) {
     const p = paths[i];
-    const body = await gh.getFile(ref.owner, ref.repo, p, branch, { token });
-    const result = await reviewOne(body, {
+    const fileBody = await gh.getFile(ref.owner, ref.repo, p, branch, { token });
+    const result = await reviewOne(fileBody, {
       title: `${ref.owner}/${ref.repo}:${branch} ${p}`,
       endpoint: picked.endpoint,
       origin,
@@ -396,25 +440,42 @@ app.post("/api/reviews/github/branch", wrap(async (req, res) => {
     prevFailureKind = result.l3Failure ? result.l3Failure.kind : null;
   }
   // scanned は実際に走らせた件数。stopped で抜けたときは paths.length と一致しない
-  res.json({
-    kind: "branch", repo: { ...ref, branch, hasIssues: repo.hasIssues },
-    scanned: reviews.length, total, truncated, reviews, stopped, notScanned,
-  });
+  return {
+    status: 200,
+    json: {
+      kind: "branch", repo: { ...ref, branch, hasIssues: repo.hasIssues },
+      scanned: reviews.length, total, truncated, reviews, stopped, notScanned,
+    },
+  };
+}
+
+app.post("/api/reviews/github/branch", wrap(async (req, res) => {
+  const r = await runBranchReview(req.body, { token: auth.tokenFor(req) });
+  res.status(r.status).json(r.json);
 }));
 
-app.post("/api/findings/:id/verdict", wrap(async (req, res) => {
-  const verdict = req.body?.verdict;
+/**
+ * POST /api/findings/:id/verdict の中身。HTTP からも MCP (set_verdict ツール) からも呼ぶ (4.1)。
+ * who は決めた人・記録される名前 ({userId, decidedBy})。HTTP は actor(req)、
+ * MCP は固定で {userId: null, decidedBy: "mcp"} を渡す (docs/design-06-mcp.md 6.2)。
+ */
+async function runVerdict(findingId, body, who) {
+  const verdict = body?.verdict;
   if (verdict !== "accepted" && verdict !== "rejected") {
-    return res.status(400).json({ error: "verdict は accepted か rejected" });
+    return { status: 400, json: { error: "verdict は accepted か rejected" } };
   }
-  const who = actor(req);
-  const row = await db.addVerdict(Number(req.params.id), {
+  const row = await db.addVerdict(Number(findingId), {
     verdict,
-    correctedText: req.body?.correctedText,
-    note: req.body?.note,
+    correctedText: body?.correctedText,
+    note: body?.note,
     ...who,
   });
-  res.json(row);
+  return { status: 200, json: row };
+}
+
+app.post("/api/findings/:id/verdict", wrap(async (req, res) => {
+  const r = await runVerdict(req.params.id, req.body, actor(req));
+  res.status(r.status).json(r.json);
 }));
 
 // 採用された指摘から issue を立てる。
@@ -805,6 +866,7 @@ for (const host of hosts) {
       console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=0)"}   OAuth: ${auth.oauthConfigured() ? "設定済み" : "未設定"}   .env の PAT: ${gh.envToken() ? "あり" : "なし"}`);
       const epList = endpoints.list();
       console.log(`接続先: ${epList.length ? epList.map((e) => `${e.name}${e.external ? "(外部)" : ""}`).join(", ") : "(なし)"}`);
+      console.log(`MCP: /mcp`);
     }
     console.log(`  待ち受け ${host.includes(":") ? `[${host}]` : host}:${PORT}`);
   });
