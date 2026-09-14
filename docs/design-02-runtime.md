@@ -814,6 +814,7 @@ commit;
 | `app.js` `reviewBlock` | 「指摘なし。」の条件を 9.3 に変える |
 | `tuning/export_snapshot.py` | `labeled_findings` に `findings` を結合し、`origin_id` で写しを畳む (6.2、15章 RT-06) |
 | `github.js` | 変えない |
+| `mcp.js` の `review_*` ツール | 06 の 9.2。`/api/scans` と同じ関数を呼ぶ形に直し、`scanId` を返す。同じコミットで直す |
 
 ## 14. 移行
 

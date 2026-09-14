@@ -7,11 +7,12 @@
 | 文書 | 中身 |
 |---|---|
 | [要件](docs/design-review-api-requirements-v2.md) | 層の構成、検出対象、評価。草案は [こちら](docs/design-review-api-requirements.md) |
-| [追加設計の地図](docs/design-00-overview.md) | 5本への分割、依存の順序、共通の決定 |
+| [追加設計の地図](docs/design-00-overview.md) | 6本への分割、依存の順序、共通の決定 |
 | [01 測定](docs/design-01-measurement.md) | 未検知の記録と recall。**実装済み** |
 | [02 実行基盤](docs/design-02-runtime.md) | 走査を束ね、非同期にし、繰り返しを0回にする。**書いた** |
 | [03 入力](docs/design-03-input.md) / [04 観点](docs/design-04-aspects.md) | 未着手。解くべき問題の一覧 |
 | [05 LLM の接続先](docs/design-05-llm-endpoints.md) | 接続先を複数持ち、レビューごとに選ぶ。OpenRouter 対応と API キーの置き場所。**書いた** |
+| [06 MCP からの呼び出し](docs/design-06-mcp.md) | Claude Code などの AI の道具から、貼り付け・PR・ブランチ・採否の経路を MCP のツールとして呼ぶ。**書いた。実装済み** |
 | [OpenRouter の確認メモ](docs/openrouter-2026-09-11.md) | 公式ドキュメントから一次確認した事実 (2026-09-11)。設計 05 の出典 |
 
 ## 起動
