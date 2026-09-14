@@ -15,6 +15,8 @@ create table documents (
     sha256     text        not null unique,   -- 本文の hash。同じ文書の再レビューを重複させない
     title      text,
     body       text        not null,
+    -- 生成モデルが書いたか人が書いたか。学習データの正例・負例を分ける前提になる (要件 L4-02, L4-13)
+    origin     text        not null default 'model' check (origin in ('model', 'human')),
     created_at timestamptz not null default now()
 );
 

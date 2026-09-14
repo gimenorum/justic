@@ -7,9 +7,12 @@
 | 文書 | 中身 |
 |---|---|
 | [要件](docs/design-review-api-requirements-v2.md) | 層の構成、検出対象、評価。草案は [こちら](docs/design-review-api-requirements.md) |
-| [追加設計の地図](docs/design-00-overview.md) | 4本への分割、依存の順序、共通の決定 |
+| [追加設計の地図](docs/design-00-overview.md) | 5本への分割、依存の順序、共通の決定 |
 | [01 測定](docs/design-01-measurement.md) | 未検知の記録と recall。**実装済み** |
-| [02 実行基盤](docs/design-02-runtime.md) / [03 入力](docs/design-03-input.md) / [04 観点](docs/design-04-aspects.md) | 未着手。解くべき問題の一覧 |
+| [02 実行基盤](docs/design-02-runtime.md) | 走査を束ね、非同期にし、繰り返しを0回にする。**書いた** |
+| [03 入力](docs/design-03-input.md) / [04 観点](docs/design-04-aspects.md) | 未着手。解くべき問題の一覧 |
+| [05 LLM の接続先](docs/design-05-llm-endpoints.md) | 接続先を複数持ち、レビューごとに選ぶ。OpenRouter 対応と API キーの置き場所。**書いた** |
+| [OpenRouter の確認メモ](docs/openrouter-2026-09-11.md) | 公式ドキュメントから一次確認した事実 (2026-09-11)。設計 05 の出典 |
 
 ## 起動
 
@@ -46,6 +49,37 @@ OAuth を使うときは、**登録した callback と同じホスト名で開�
 乗る。`/auth/login` は `JUSTIC_ORIGIN` (既定 `http://127.0.0.1:5180`) に寄せてから
 OAuth に出すので、どちらで開いても最後は1つの origin に揃う。
 
+## 接続先
+
+L3 (設計チェック) がどの LLM に送るかは `~/.config/justic/endpoints.json` で決める。
+リポジトリ直下の `endpoints.example.json` を写して URL・モデル・`key_file` を直す
+(キーは書かない)。設定ファイルが無ければ、いまどおり `.env` の `JUSTIC_BASE_URL` /
+`JUSTIC_MODEL` / `JUSTIC_API_KEY` から手元用の接続先を1つ組み立てる。
+
+```sh
+mkdir -p ~/.config/justic
+cp endpoints.example.json ~/.config/justic/endpoints.json
+# URL・モデル・key_file を編集する
+```
+
+キーは接続先ごとの1行ファイルに置き、`endpoints.json` の `key_file` にパスを書く。
+**group と other に読み権限があれば読まずに拒む (0600 か 0400 にする)**
+(`chmod 600 <パス>` で直す。ファイルが無い・1行目が空のときも同じく拒む)。
+`key_file` を書かない接続先はキーを送らないだけで、失敗にはならない。
+
+```sh
+echo "sk-xxxxx" > ~/.config/justic/openrouter-key
+chmod 600 ~/.config/justic/openrouter-key
+```
+
+画面には接続先の一覧が出る。**外部の接続先を選ぶと、本文の全文がそこへ送られる**
+(抜粋や要約ではない)。選ぶと直下に注記が出る。選択は覚えない。画面を開き直すと
+`/api/health` の既定に戻る。
+
+接続先の一覧は起動時に1回だけ読むので、足したり消したりしたら再起動が要る。
+キーファイルは呼び出しのたびに読み直すので、キーの差し替え (失効・再発行) は
+再起動なしで効く。詳しくは [設計 05](docs/design-05-llm-endpoints.md)。
+
 ## 対象の選び方
 
 | モード | 何を見るか |
@@ -53,6 +87,11 @@ OAuth に出すので、どちらで開いても最後は1つの origin に揃�
 | 貼り付け | 本文をそのまま |
 | PR の差分 | **その PR が足した行**の文体指摘だけ。もとからあった行は出さない |
 | ブランチ走査 | デフォルトブランチの Markdown。**採用した指摘から issue を立てられる** |
+
+書き手(出自)も選べる。**生成モデル**か**人**かの二択で、既定は生成モデル。
+直訳調の分類器 (L4) の学習データは、この出自で正例・負例を振り分ける
+(生成モデル → 正例、人 → 負例)。人が書いた文書を入れるときは必ず「人」を選ぶ。
+同じ本文を別の出自で登録し直すことはできない。
 
 PR で L1 (文体) を差分の行に絞るのは、その PR が持ち込んでいない指摘で画面が埋まるのを防ぐため。
 L3 (設計内容) は差分では判定できない。「異常系が書かれていない」は書かれていないことの指摘なので、
@@ -134,7 +173,7 @@ cd tuning && ../.venv/bin/python measure_recall.py --aspect D-01 --save
 混ぜると、注釈ゼロの文書が分子にだけ寄与し recall が自動的に 1.0 に近づく。
 注釈が0件でも押してよい。ゼロは「システムが全部拾った」という記録になる。
 
-注釈は `findings` に入れず別表に持つ。`findings` は review 単位なので、
+注釈は `findings` ではなく別表に持つ。`findings` は review 単位なので、
 再レビューすると注釈が古い review に取り残されるため。
 
 ## 環境

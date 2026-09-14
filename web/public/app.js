@@ -324,9 +324,15 @@ async function annotationPanel(reviewId) {
 
   runs.hidden = !full.aspectRuns?.length;
   if (full.aspectRuns?.length) {
-    runs.innerHTML = "走った観点: " + full.aspectRuns.map((r) =>
-      `<span class="st-${r.status}">${r.aspect_id} ${r.status}${r.error ? " — " + r.error.slice(0, 40) : ""}</span>`
-    ).join(" / ");
+    runs.innerHTML = "走った観点: " + full.aspectRuns.map((r) => {
+      const parts = [`${r.aspect_id} ${r.status}`];
+      if (r.endpoint) parts.push(`接続先 ${r.endpoint}${r.endpoint_external ? " (外部)" : ""}`);
+      // finish_reason='length' は「JSON が見つからない」と混同させない (設計 8.5)
+      if (r.finish_reason === "length") parts.push("出力が途中で切れた");
+      else if (r.error) parts.push(`— ${r.error.slice(0, 40)}`);
+      if (r.cost != null) parts.push(`費用 ${r.cost}`);
+      return `<span class="st-${r.status}">${parts.join(" ")}</span>`;
+    }).join(" / ");
   }
   renderHead(); paintMarks(); renderList(); paintSelection();
   return panel;
@@ -477,6 +483,8 @@ $("run").onclick = async () => {
   const { url, body } = ENDPOINTS[mode]();
   if (!body.body && !body.ref) { $("runState").textContent = "対象が空"; return; }
   body.useL3 = $("useL3").checked;
+  body.origin = $("origin").value;
+  body.endpoint = $("endpoint").value;
 
   $("run").disabled = true;
   $("runState").textContent = "検査中…";
@@ -494,6 +502,12 @@ $("run").onclick = async () => {
     }
 
     const notes = [];
+    // 接続先の名前と外部の印。1回の要求の中で接続先は変わらない (設計 6.1)
+    const usedEndpoints = [...new Set(reviews.map((x) => x.endpoint).filter(Boolean))];
+    if (usedEndpoints.length) {
+      const external = reviews.some((x) => x.endpoint && x.endpointExternal);
+      notes.push(`接続先: ${usedEndpoints.join(", ")}${external ? " (外部)" : ""}`);
+    }
     const notChecked = reviews.some((x) => x.notChecked?.length);
     if (notChecked) notes.push("未検査: 設計チェック (LLM)。文体が通っても設計の妥当性は見ていない。");
     const outside = reviews.reduce((n, x) => n + (x.l1OutsideDiff ?? 0), 0);
@@ -504,6 +518,14 @@ $("run").onclick = async () => {
     if (r.note) notes.push(r.note);
     const errs = reviews.flatMap((x) => x.l3Errors ?? []);
     if (errs.length) notes.push(`L3 でエラー: ${errs.join(" / ")}`);
+    // 止めた接続先と、走らせなかったファイル (設計 14.3)
+    const stopped = reviews.map((x) => x.stopped).find(Boolean) ?? r.stopped;
+    if (stopped) {
+      notes.push(`接続先 ${stopped.endpoint} で検査を止めた (${stopped.reason === "rate_limit" ? "レート制限" : "接続先の失敗"}): ${stopped.message}`);
+    }
+    if (r.notScanned?.length) {
+      notes.push(`未走査のまま残った ${r.notScanned.length}件: ${r.notScanned.slice(0, 5).join(", ")}${r.notScanned.length > 5 ? " …" : ""}`);
+    }
     $("notice").hidden = notes.length === 0;
     $("notice").textContent = notes.join("  ");
 
@@ -579,6 +601,37 @@ function renderAccount(h) {
   }
 }
 
+// ---- 接続先の選択 (docs/design-05-llm-endpoints.md 13章) --------------
+//
+// 既定は /api/health の default。画面を開き直すと既定に戻る。覚えない。
+
+function renderEndpointSelect(h) {
+  const sel = $("endpoint");
+  const eps = h.endpoints ?? [];
+  sel.innerHTML = eps.map((e) =>
+    `<option value="${e.name}"${e.default ? " selected" : ""}></option>`
+  ).join("");
+  [...sel.options].forEach((opt, i) => {
+    const e = eps[i];
+    opt.textContent = `${e.title}${e.external ? " (外部)" : ""}`;
+  });
+  sel.disabled = !h.l3 || eps.length === 0;
+  updateEndpointNote();
+}
+
+function updateEndpointNote() {
+  const eps = state.health.endpoints ?? [];
+  const chosen = eps.find((e) => e.name === $("endpoint").value);
+  const note = $("endpointNote");
+  if (!chosen || !chosen.external) { note.hidden = true; note.textContent = ""; return; }
+  const parts = [`本文の全文が ${chosen.title} に送られる。`];
+  if (chosen.provider) parts.push("提供元の保存を断る指定つき。");
+  note.textContent = parts.join(" ");
+  note.hidden = false;
+}
+
+$("endpoint").onchange = updateEndpointNote;
+
 (async () => {
   try {
     state.health = await api("/api/health");
@@ -589,6 +642,7 @@ function renderAccount(h) {
     $("useL3").disabled = !h.l3;
     if (!h.l3) { $("useL3").checked = false; $("useL3").parentElement.title = "JUSTIC_L3=0 で切ってある"; }
     if (!h.github.token) $("issueRepo").placeholder = "GitHub にログインすると起票できる";
+    renderEndpointSelect(h);
   } catch (e) {
     $("health").textContent = `接続できない: ${e.message}`;
   }

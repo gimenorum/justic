@@ -1,0 +1,104 @@
+[
+  {
+    "repo": "rurema/doctree",
+    "sha": "2663ce16d43d2fdcba8b729f12d26cf05e205a0c",
+    "date": "2022-11-29",
+    "license": "CC BY 3.0 (refm/doc/license.rd)",
+    "paths": [
+      "refm/doc/spec/*.rd"
+    ],
+    "format": "rd",
+    "why_japanese": "Ruby リファレンスマニュアルを日本語で書き下ろす企画。英語版は無い",
+    "note": "refm/doc/spec 配下の .rd が対象。21 ファイル"
+  },
+  {
+    "repo": "Siv3D/siv3d.docs",
+    "sha": "804b13ab1af0b8c2fb02c520a626d2ae128349f4",
+    "date": "2022-11-28",
+    "license": "MIT",
+    "paths": [
+      "docs/ja-jp/learn/hello-siv3d.md",
+      "docs/ja-jp/learn/shape.md"
+    ],
+    "format": "markdown",
+    "why_japanese": "ja-jp が先に書かれ、同名の英語版はこの時点で無い",
+    "note": ""
+  },
+  {
+    "repo": "mixi-inc/AndroidTraining",
+    "sha": "b10a35143295d0e4b2248502f46d659631680c71",
+    "date": "2019-06-10",
+    "license": "Apache-2.0",
+    "paths": [
+      "docs/fundamentals/2.01.create-layout.md",
+      "docs/fundamentals/2.02.activity-and-fragment.md"
+    ],
+    "format": "markdown",
+    "why_japanese": "ミクシィの研修資料。英語版は無い",
+    "note": "docs/fundamentals 配下を先頭 (ファイル名順) から 2 本。合計約 60KB になるよう選定済み"
+  },
+  {
+    "repo": "kaityo256/python_zero",
+    "sha": "79f4891de387e5217618dfacd0e32a38c7bef990",
+    "date": "2022-11-21",
+    "license": "本文 CC BY 4.0 / コード MIT",
+    "paths": [
+      "class/README.md",
+      "file/README.md"
+    ],
+    "format": "markdown",
+    "why_japanese": "講義資料「ゼロから学ぶ Python」。英語版は無い",
+    "note": ""
+  },
+  {
+    "repo": "azu/promises-book",
+    "sha": "45dfd896c7bf4153c36ffdaa43e73e2895b7f6de",
+    "date": "2022-08-23",
+    "license": "MIT",
+    "paths": [
+      "Ch2_HowToWrite/**/*.adoc"
+    ],
+    "format": "adoc",
+    "why_japanese": "日本語で書かれた「JavaScript Promise の本」。この SHA に英訳は無い",
+    "note": "Ch2_HowToWrite 配下の .adoc 12 ファイル"
+  },
+  {
+    "repo": "ymmt2005/grpc-tutorial",
+    "sha": "f30d4da5015284279468cec1064028dcc31d7178",
+    "date": "2021-07-31",
+    "license": "MIT",
+    "paths": [
+      "README.md"
+    ],
+    "format": "markdown",
+    "why_japanese": "冒頭に 2021 年のサイボウズ社内研修用と明記",
+    "note": ""
+  },
+  {
+    "repo": "WorksApplications/Sudachi",
+    "sha": "4ba72f2da3dd51dfb4b13313b7be33c433f72874",
+    "date": "2022-10-07",
+    "license": "Apache-2.0",
+    "paths": [
+      "docs/index.md",
+      "docs/tutorial.md",
+      "docs/user_dict.md",
+      "docs/tutorial_plugin.md"
+    ],
+    "format": "markdown",
+    "why_japanese": "docs/index.md (2020-10-06) が英語版 (10-08) より先",
+    "note": ""
+  },
+  {
+    "repo": "mocobeta/janome",
+    "sha": "1d13da63ccdddb2bcdef9eb6e575950ad92c917c",
+    "date": "2022-03-05",
+    "license": "Apache-2.0",
+    "paths": [
+      "docs/ja/index.rst"
+    ],
+    "format": "rst",
+    "why_japanese": "2015 年の docs/index.rst が日本語、英語版は 2017 年追加",
+    "note": ""
+  }
+]

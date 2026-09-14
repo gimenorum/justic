@@ -32,15 +32,30 @@ export async function withTransaction(fn) {
   }
 }
 
-export async function upsertDocument(title, body) {
+export async function upsertDocument(title, body, origin = "model") {
   const digest = sha256(body);
   // 同じ本文を二度入れない。再レビューしても文書は1行のまま。
+  // ただし origin が食い違う場合は更新しない。同じ本文が生成モデルと人の
+  // 両方の出自を持つのは矛盾する (学習データの正例・負例の前提が壊れる、要件 L4-02)。
+  // on conflict の WHERE が false になると、insert も update もされず
+  // 行が返らない。それを検知の合図にする。
   const { rows } = await pool.query(
-    `insert into documents (sha256, title, body) values ($1, $2, $3)
-     on conflict (sha256) do update set title = coalesce(excluded.title, documents.title)
-     returning id, sha256, created_at`,
-    [digest, title || null, body],
+    `insert into documents (sha256, title, body, origin) values ($1, $2, $3, $4)
+     on conflict (sha256) do update
+       set title = coalesce(excluded.title, documents.title)
+       where documents.origin = excluded.origin
+     returning id, sha256, created_at, origin`,
+    [digest, title || null, body, origin],
   );
+  if (rows.length === 0) {
+    const { rows: existing } = await pool.query(
+      `select origin from documents where sha256 = $1`, [digest]);
+    const prev = existing[0]?.origin ?? "unknown";
+    throw new Error(
+      `同じ本文の文書が既に origin=${prev} で登録されている (今回の指定は origin=${origin})。` +
+      `同じ本文が両方の出自を持つのは矛盾する`,
+    );
+  }
   return rows[0];
 }
 
@@ -84,13 +99,21 @@ export async function insertFindings(reviewId, findings, client = pool) {
 export async function recordAspectRun(reviewId, r, client = pool) {
   await client.query(
     `insert into review_aspects
-       (review_id, aspect_id, status, findings_n, model_id, prompt_version, error, started_at, finished_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       (review_id, aspect_id, status, findings_n, model_id, prompt_version, error, started_at, finished_at,
+        endpoint, endpoint_external, finish_reason, prompt_tokens, completion_tokens, cost, usage_raw)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
      on conflict (review_id, aspect_id) do update
        set status = excluded.status, findings_n = excluded.findings_n,
-           error = excluded.error, finished_at = excluded.finished_at`,
+           error = excluded.error, finished_at = excluded.finished_at,
+           endpoint = excluded.endpoint, endpoint_external = excluded.endpoint_external,
+           finish_reason = excluded.finish_reason, prompt_tokens = excluded.prompt_tokens,
+           completion_tokens = excluded.completion_tokens, cost = excluded.cost,
+           usage_raw = excluded.usage_raw`,
     [reviewId, r.aspectId, r.status, r.findingsN ?? 0, r.modelId ?? null,
-     r.promptVersion ?? null, r.error ?? null, r.startedAt ?? null, r.finishedAt ?? null],
+     r.promptVersion ?? null, r.error ?? null, r.startedAt ?? null, r.finishedAt ?? null,
+     r.endpoint ?? null, r.endpointExternal ?? null, r.finishReason ?? null,
+     r.promptTokens ?? null, r.completionTokens ?? null, r.cost ?? null,
+     r.usageRaw ? JSON.stringify(r.usageRaw) : null],
   );
 }
 

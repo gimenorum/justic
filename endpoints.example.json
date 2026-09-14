@@ -1,0 +1,22 @@
+{
+  "default": "local",
+  "endpoints": [
+    {
+      "name": "local", "title": "手元のルーター",
+      "base_url": "http://127.0.0.1:18080/v1",
+      "model": "", "external": false,
+      "key_file": "~/.config/justic/local-key",
+      "max_tokens": 4000, "temperature": 0, "timeout_ms": 120000,
+      "thinking": {"mode": "chat_template_kwargs"}
+    },
+    {
+      "name": "openrouter", "title": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "google/gemini-3.8-flash", "external": true,
+      "key_file": "~/.config/justic/openrouter-key",
+      "max_tokens": 8000, "temperature": null, "timeout_ms": 180000,
+      "thinking": {"mode": "reasoning", "effort": "low", "exclude": true},
+      "provider": {"data_collection": "deny", "zdr": true}
+    }
+  ]
+}

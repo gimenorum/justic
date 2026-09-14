@@ -50,8 +50,18 @@
     <div class="actions">
       <button id="run" class="primary">検査する</button>
       <label class="l3"><input type="checkbox" id="useL3" checked> 設計チェック (LLM)</label>
+      <label class="endpoint">接続先
+        <select id="endpoint"></select>
+      </label>
+      <label class="origin">書き手
+        <select id="origin">
+          <option value="model" selected>生成モデル</option>
+          <option value="human">人</option>
+        </select>
+      </label>
       <span id="runState" class="state"></span>
     </div>
+    <p id="endpointNote" class="help" hidden></p>
 
     <div id="issuePanel" class="issue-panel" hidden>
       <label>起票先 <input id="issueRepo" placeholder="owner/repo"></label>

@@ -19,3 +19,8 @@ __pycache__/
 
 # 資格情報。GitHub の PAT をここに置く
 .env
+
+# LLM の接続先の設定とキー。正は ~/.config/justic/ に置く (docs/design-05-llm-endpoints.md の 5.5)。
+# リポジトリの中に置いてしまった人を助けるための保険
+endpoints.json
+*-key

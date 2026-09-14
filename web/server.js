@@ -7,11 +7,24 @@ import * as gh from "./github.js";
 import * as auth from "./auth.js";
 import { lintMarkdown } from "./lint.js";
 import { l3Enabled, runL3, ASPECTS, toRuntimeAspects } from "./llm.js";
+import * as endpoints from "./endpoints.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.PORT ?? 5180);
 const ORIGIN = process.env.JUSTIC_ORIGIN ?? `http://127.0.0.1:${PORT}`;
+
+// 接続先の設定は起動時に1回だけ読む (docs/design-05-llm-endpoints.md の 4.5)。
+// 壊れていれば、どこへ送るか決まらないまま動かさない (4.4)。
+try {
+  endpoints.init();
+} catch (e) {
+  console.error(`接続先の設定が読めない: ${e.message}`);
+  process.exit(1);
+}
+
+// L3 が実際に使えるか。接続先が0件なら JUSTIC_L3=0 と同じ扱いにする (4.4)。
+const l3Available = () => l3Enabled() && endpoints.list().length > 0;
 
 // ループバックで待っていても、この機械の上のブラウザからは誰でも届く。
 // 利用者が踏んだ外部のページから POST されると、.env の PAT モードでは
@@ -50,6 +63,43 @@ const wrap = (fn) => (req, res) => fn(req, res).catch((e) => {
 function actor(req) {
   const s = auth.sessionOf(req);
   return { userId: s?.userId ?? null, decidedBy: s?.login ?? "local" };
+}
+
+// 出自。生成モデルが書いたか、人が書いたか (要件 L4-13)。省略時は 'model'。
+// 不正な値は null を返し、呼び出し側で 400 にする。
+const VALID_ORIGINS = new Set(["model", "human"]);
+function parseOrigin(raw) {
+  if (raw === undefined || raw === null || raw === "") return "model";
+  return VALID_ORIGINS.has(raw) ? raw : null;
+}
+
+/**
+ * 要求本文の endpoint を接続先に解決する。無ければ既定、既定が無ければ失敗。
+ * 設定に無い名前も失敗で、選べる名前を文言に並べる (docs/design-05-llm-endpoints.md の 6.1)。
+ * 呼び出し側で 400 にする。
+ */
+function parseEndpoint(req) {
+  const requested = req.body?.endpoint;
+  if (requested === undefined || requested === null || requested === "") {
+    const name = endpoints.defaultName();
+    if (!name) return { error: "接続先 (endpoint) を選ぶ。既定が決まっていない" };
+    return { endpoint: endpoints.get(name) };
+  }
+  const ep = endpoints.get(String(requested));
+  if (!ep) {
+    const names = endpoints.list().map((e) => e.name);
+    return { error: `接続先 '${requested}' は無い。選べるのは: ${names.join(", ") || "(設定なし)"}` };
+  }
+  return { endpoint: ep };
+}
+
+/**
+ * この要求で L3 を走らせるか。useL3 が立っていて L3 が使えるときだけ、
+ * 接続先を解決する。L3 を求めていない要求まで endpoint を必須にしない。
+ */
+function endpointForRequest(req) {
+  if (!req.body?.useL3 || !l3Available()) return { endpoint: null };
+  return parseEndpoint(req);
 }
 
 // ---- 認証 --------------------------------------------------------------
@@ -125,10 +175,16 @@ app.get("/api/me", wrap(async (req, res) => {
  * L3 は差分では判定できない。「異常系が書かれていない」は
  * 書かれていないことの指摘なので、全文を見る必要がある。
  * 差分の外に出たものは in_diff=false を付けて残す。
+ *
+ * origin は文書の出自 ('model' | 'human')。学習データの正例・負例を
+ * 出自で振り分ける前提になる (要件 L4-02, L4-13)。省略時は 'model'。
+ *
+ * endpoint は呼び出し側が解決済みの接続先 (docs/design-05-llm-endpoints.md)。
+ * null なら L3 は走らせない。
  */
-async function reviewOne(bodyText, { title, useL3, sourceKind = "paste", sourceRef = null, addedLines = null }) {
-  const doc = await db.upsertDocument(title, bodyText);
-  const wantL3 = Boolean(useL3) && l3Enabled();
+async function reviewOne(bodyText, { title, endpoint = null, origin = "model", sourceKind = "paste", sourceRef = null, addedLines = null }) {
+  const doc = await db.upsertDocument(title, bodyText, origin);
+  const wantL3 = Boolean(endpoint);
   const layers = ["L1", ...(wantL3 ? ["L3"] : [])];
 
   let l1 = await lintMarkdown(bodyText);
@@ -146,7 +202,7 @@ async function reviewOne(bodyText, { title, useL3, sourceKind = "paste", sourceR
     // 観点は aspects 表が正。llm.js は実行時の情報 (ruleId、プロンプト版) を持つ。
     const rows = await db.aspects().catch(() => []);
     const runtime = toRuntimeAspects(rows);
-    l3 = await runL3(bodyText, runtime.length > 0 ? { aspects: runtime } : {});
+    l3 = await runL3(bodyText, { ...(runtime.length > 0 ? { aspects: runtime } : {}), endpoint });
     for (const f of l3.findings) {
       f.inDiff = addedLines ? (f.line != null && addedLines.has(f.line)) : null;
     }
@@ -174,10 +230,17 @@ async function reviewOne(bodyText, { title, useL3, sourceKind = "paste", sourceR
     documentSha256: doc.sha256,
     title,
     layers,
+    // どの接続先で走ったか。画面が見出しに出す (13章)
+    endpoint: endpoint?.name ?? null,
+    endpointExternal: endpoint?.external ?? null,
     notChecked: wantL3 ? [] : ["L3 (設計内容)"],
     droppedByEvidenceCheck: l3?.dropped ?? 0,
     l1OutsideDiff,
     l3Errors: l3?.errors ?? [],
+    stopped: l3?.stopped ?? null,
+    // 最初に起きた unreachable/other の失敗。複数ファイルの走査で
+    // 「同じ理由が2回続いたら止める」の判定に使う (14章)
+    l3Failure: l3?.failure ?? null,
     findings: stored,
   };
 }
@@ -187,7 +250,8 @@ app.get("/api/health", wrap(async (req, res) => {
   const s = auth.sessionOf(req);
   res.json({
     db: "ok",
-    l3: l3Enabled(),
+    l3: l3Available(),
+    endpoints: await endpoints.describe(),
     github: {
       // ログインしていればその人のトークン、していなければ .env の PAT
       token: gh.hasToken(s?.token),
@@ -214,36 +278,75 @@ app.post("/api/reviews", wrap(async (req, res) => {
   const body = String(req.body?.body ?? "").trim();
   if (!body) return res.status(400).json({ error: "本文が空です" });
   const title = req.body?.title ? String(req.body.title).slice(0, 200) : null;
-  res.json(await reviewOne(body, { title, useL3: req.body?.useL3 }));
+  const origin = parseOrigin(req.body?.origin);
+  if (origin === null) return res.status(400).json({ error: "origin は 'model' か 'human'" });
+  const picked = endpointForRequest(req);
+  if (picked.error) return res.status(400).json({ error: picked.error });
+  const result = await reviewOne(body, { title, endpoint: picked.endpoint, origin });
+  // 貼り付け経路はファイルが1つなので notScanned は常に空 (14.3)
+  res.json({ ...result, notScanned: [] });
 }));
 
 app.post("/api/reviews/github/pr", wrap(async (req, res) => {
   const ref = gh.parsePullRef(req.body?.ref);
   if (!ref) return res.status(400).json({ error: "PR の URL か owner/repo#番号 を渡す" });
+  const origin = parseOrigin(req.body?.origin);
+  if (origin === null) return res.status(400).json({ error: "origin は 'model' か 'human'" });
+  const picked = endpointForRequest(req);
+  if (picked.error) return res.status(400).json({ error: picked.error });
   const token = auth.tokenFor(req);
 
   const pr = await gh.getPull(ref.owner, ref.repo, ref.number, { token });
   const files = await gh.getMarkdownFiles(ref.owner, ref.repo, ref.number, { headSha: pr.headSha, token });
   if (files.length === 0) {
-    return res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews: [], note: "この PR は Markdown を変更していない" });
+    return res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews: [], note: "この PR は Markdown を変更していない", stopped: null, notScanned: [] });
   }
 
+  // 接続先は1回の要求で1つ (6.1)。ファイルごとに選び直さない。
   const reviews = [];
-  for (const f of files) {
-    reviews.push(await reviewOne(f.body, {
+  let stopped = null;
+  let notScanned = [];
+  let prevFailureKind = null;
+  for (let i = 0; i < files.length; i += 1) {
+    const f = files[i];
+    const result = await reviewOne(f.body, {
       title: `${ref.owner}/${ref.repo}#${ref.number} ${f.path}`,
-      useL3: req.body?.useL3,
+      endpoint: picked.endpoint,
+      origin,
       sourceKind: "github_pr",
       sourceRef: { ...ref, head_sha: pr.headSha, path: f.path, html_url: pr.htmlUrl },
       addedLines: f.addedLines,
-    }));
+    });
+    reviews.push(result);
+    // 止める失敗が起きたら、その場で抜けて残りを notScanned に積む (14.3)。
+    // 済んだレビューは捨てない
+    if (result.stopped) {
+      stopped = result.stopped;
+      notScanned = files.slice(i + 1).map((x) => x.path);
+      break;
+    }
+    // 同じ理由 (unreachable / other) が2回続いたら止める (14章)。
+    // timeout と parse_error は数えない。失敗の無いレビューが挟まれば数え直し
+    if (result.l3Failure && prevFailureKind === result.l3Failure.kind) {
+      stopped = {
+        reason: "backend", endpoint: picked.endpoint.name,
+        message: `同じ理由で2回続いた: ${result.l3Failure.message}`,
+      };
+      notScanned = files.slice(i + 1).map((x) => x.path);
+      break;
+    }
+    prevFailureKind = result.l3Failure ? result.l3Failure.kind : null;
   }
-  res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews });
+  res.json({ kind: "pr", pr: { ...pr, ...ref }, reviews, stopped, notScanned });
 }));
 
 app.post("/api/reviews/github/branch", wrap(async (req, res) => {
   const ref = gh.parseRepoRef(req.body?.ref);
   if (!ref) return res.status(400).json({ error: "リポジトリの URL か owner/repo を渡す" });
+  const origin = parseOrigin(req.body?.origin);
+  if (origin === null) return res.status(400).json({ error: "origin は 'model' か 'human'" });
+  const picked = endpointForRequest(req);
+  if (picked.error) return res.status(400).json({ error: picked.error });
   const token = auth.tokenFor(req);
 
   const repo = await gh.getRepo(ref.owner, ref.repo, { token });
@@ -253,19 +356,50 @@ app.post("/api/reviews/github/branch", wrap(async (req, res) => {
     prefix: req.body?.prefix ?? "",
     token,
   });
-  if (paths.length === 0) return res.json({ kind: "branch", repo: { ...ref, branch }, reviews: [], note: "Markdown が無い" });
+  if (paths.length === 0) {
+    return res.json({ kind: "branch", repo: { ...ref, branch }, reviews: [], note: "Markdown が無い", stopped: null, notScanned: [] });
+  }
 
+  // 接続先は1回の要求で1つ (6.1)。ファイルごとに選び直さない。
   const reviews = [];
-  for (const p of paths) {
+  let stopped = null;
+  let notScanned = [];
+  let prevFailureKind = null;
+  for (let i = 0; i < paths.length; i += 1) {
+    const p = paths[i];
     const body = await gh.getFile(ref.owner, ref.repo, p, branch, { token });
-    reviews.push(await reviewOne(body, {
+    const result = await reviewOne(body, {
       title: `${ref.owner}/${ref.repo}:${branch} ${p}`,
-      useL3: req.body?.useL3,
+      endpoint: picked.endpoint,
+      origin,
       sourceKind: "github_pr",
       sourceRef: { ...ref, ref: branch, path: p, html_url: `${repo.htmlUrl}/blob/${branch}/${p}` },
-    }));
+    });
+    reviews.push(result);
+    // 止める失敗が起きたら、その場で抜けて残りを notScanned に積む (14.3)。
+    // 済んだレビューは捨てない
+    if (result.stopped) {
+      stopped = result.stopped;
+      notScanned = paths.slice(i + 1);
+      break;
+    }
+    // 同じ理由 (unreachable / other) が2回続いたら止める (14章)。
+    // timeout と parse_error は数えない。失敗の無いレビューが挟まれば数え直し
+    if (result.l3Failure && prevFailureKind === result.l3Failure.kind) {
+      stopped = {
+        reason: "backend", endpoint: picked.endpoint.name,
+        message: `同じ理由で2回続いた: ${result.l3Failure.message}`,
+      };
+      notScanned = paths.slice(i + 1);
+      break;
+    }
+    prevFailureKind = result.l3Failure ? result.l3Failure.kind : null;
   }
-  res.json({ kind: "branch", repo: { ...ref, branch, hasIssues: repo.hasIssues }, scanned: paths.length, total, truncated, reviews });
+  // scanned は実際に走らせた件数。stopped で抜けたときは paths.length と一致しない
+  res.json({
+    kind: "branch", repo: { ...ref, branch, hasIssues: repo.hasIssues },
+    scanned: reviews.length, total, truncated, reviews, stopped, notScanned,
+  });
 }));
 
 app.post("/api/findings/:id/verdict", wrap(async (req, res) => {
@@ -668,7 +802,9 @@ for (const host of hosts) {
     ready += 1;
     if (ready === 1) {
       console.log(`justic  ${ORIGIN}`);
-      console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=1)"}   OAuth: ${auth.oauthConfigured() ? "設定済み" : "未設定"}   .env の PAT: ${gh.envToken() ? "あり" : "なし"}`);
+      console.log(`L3: ${l3Enabled() ? "有効" : "無効 (JUSTIC_L3=0)"}   OAuth: ${auth.oauthConfigured() ? "設定済み" : "未設定"}   .env の PAT: ${gh.envToken() ? "あり" : "なし"}`);
+      const epList = endpoints.list();
+      console.log(`接続先: ${epList.length ? epList.map((e) => `${e.name}${e.external ? "(外部)" : ""}`).join(", ") : "(なし)"}`);
     }
     console.log(`  待ち受け ${host.includes(":") ? `[${host}]` : host}:${PORT}`);
   });
